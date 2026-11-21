@@ -1,0 +1,143 @@
+// https://github.com/bea4dev/liquid-desktop-shojiwm in niri. The wallpaper is water: windows and
+// the pointer make waves in it, and windows splash when they open and close. The terminals get
+// liquid glass over the blurred backdrop, with the parameters of the config's index.tsx. The other
+// windows show the rest of the config's window shaders, which it ships but doesn't use:
+// water-terminal, frozen-glass and electric-frame. All the .frag files are the originals,
+// unchanged.
+//
+//     examples/shojiwm-configs/run.sh liquid-desktop [wallpaper.png]
+
+include "common.kdl"
+
+spawn-at-startup "kitty" "-o" "background_opacity=0.35" "sh" "-c" "fastfetch; exec $SHELL"
+spawn-at-startup "kitty" "--class" "shoji-water" "-o" "background_opacity=0.35" "sh" "-c" "fastfetch; exec $SHELL"
+spawn-at-startup "kitty" "--class" "shoji-frozen" "-o" "background_opacity=0.35" "sh" "-c" "ls -la --color=always /usr/bin; exec $SHELL"
+spawn-at-startup "kitty" "--class" "shoji-electric" "-o" "background_opacity=0.35" "sh" "-c" "fastfetch; exec $SHELL"
+
+// The water on the wallpaper, set up like the config's water.ts does it: the simulation steps four
+// times a frame at half the resolution, then water-surface.frag draws the wallpaper through it.
+// niri feeds the uniforms that water.ts computes: the windows, the pointer and the splashes.
+layer-rule {
+    match layer="background"
+
+    shader-pipeline {
+        state "flow" scale=0.5
+        pass "liquid-desktop/water-flow.frag" target="flow" repeat=4
+        draw "liquid-desktop/water-surface.frag" {
+            texture "flow" from="flow"
+            texture "sharp" from="surface"
+            uniform "emboss" 5
+            uniform "ripple_gain" 0.15
+            uniform "refraction_px" 14
+            uniform "reflection_gain" 1.2
+            uniform "reflection_cutoff" 0.25
+            uniform "reflection_intensity" 2.5
+            uniform "specular_strength" 0.35
+            uniform "water_tint" 0.94
+        }
+    }
+}
+
+// Terminals get blur, the shaders work on it.
+window-rule {
+    match app-id="^kitty$"
+    match app-id="^com\\.mitchellh\\.ghostty$"
+    match app-id="^shoji-"
+
+    background-effect {
+        blur true
+    }
+}
+
+window-rule {
+    match app-id="^kitty$"
+    match app-id="^com\\.mitchellh\\.ghostty$"
+
+    shader "liquid-desktop/liquid-glass.frag" {
+        // backdropSource() in ShojiWM: the shader gets the blurred backdrop, and the window goes
+        // on top of what it draws.
+        input "backdrop"
+        uniform "glass_radius_px" 10.0
+        uniform "distortion_depth" 0.2
+        uniform "distortion_strength" 0.15
+        uniform "chromatic_shift_px" 3.0
+        uniform "glass_tint" 0.9
+    }
+}
+
+window-rule {
+    match app-id="^shoji-water$"
+    shader "liquid-desktop/water-terminal.frag" {
+        input "backdrop"
+        uniform "wave_speed" 0.2
+        uniform "wave_speed_x" 0.3
+        uniform "wave_speed_y" 0.3
+        uniform "emboss" 0.5
+        uniform "intensity" 2.4
+        uniform "frequency" 6.0
+        uniform "refraction_strength" 40.0
+        uniform "reflection_gain" 700.0
+        uniform "reflection_cutoff" 0.012
+        uniform "reflection_intensity" 200000.0
+        uniform "water_tint" 0.95
+    }
+}
+
+window-rule {
+    match app-id="^shoji-frozen$"
+    shader "liquid-desktop/frozen-glass.frag" {
+        input "backdrop"
+        uniform "crystal_px" 90.0
+        uniform "refraction_px" 12.0
+        uniform "crack_width" 0.06
+        uniform "crack_intensity" 0.7
+        uniform "frost_amount" 0.5
+        uniform "frost_scale" 3.0
+        uniform "edge_frost" 0.6
+        uniform "edge_frost_px" 60.0
+        uniform "ice_tint" 0.5
+        uniform "ice_opacity" 0.6
+    }
+}
+
+window-rule {
+    match app-id="^shoji-electric$"
+    shader "liquid-desktop/electric-frame.frag" {
+        input "backdrop"
+        // In ShojiWM a config animates phase_01; here it follows niri's clock.
+        uniform "phase_01" time-scale=0.25
+        uniform "speed" 1.0
+        uniform "radius_px" 10.0
+        uniform "frame_width_px" 10.0
+        uniform "glow_px" 12.0
+        uniform "intensity" 1.6
+        uniform "noise_scale" 0.5
+        uniform "edge_width" 1.0
+        uniform "noise_seed" 0.3
+    }
+}
+
+// The four startup windows in a 2 × 2 grid.
+window-rule {
+    match app-id="^kitty$" at-startup=true
+    match app-id="^shoji-" at-startup=true
+    open-floating true
+    default-column-width { proportion 0.47; }
+    default-window-height { proportion 0.46; }
+}
+window-rule {
+    match app-id="^kitty$" at-startup=true
+    default-floating-position x=24 y=24 relative-to="top-left"
+}
+window-rule {
+    match app-id="^shoji-water$" at-startup=true
+    default-floating-position x=24 y=24 relative-to="top-right"
+}
+window-rule {
+    match app-id="^shoji-frozen$" at-startup=true
+    default-floating-position x=24 y=24 relative-to="bottom-left"
+}
+window-rule {
+    match app-id="^shoji-electric$" at-startup=true
+    default-floating-position x=24 y=24 relative-to="bottom-right"
+}

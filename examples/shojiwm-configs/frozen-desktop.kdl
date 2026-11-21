@@ -1,0 +1,34 @@
+// https://github.com/bea4dev/frozen-desktop-config-shojiwm in niri: the blurred glass behind the
+// terminals is frozen into big crystals that bend what's behind them. frozen-glass.frag is the
+// original file, unchanged; the config ships the same one as liquid-desktop.
+//
+//     examples/shojiwm-configs/run.sh frozen-desktop [wallpaper.png]
+
+include "common.kdl"
+
+spawn-at-startup "kitty" "-o" "background_opacity=0" "sh" "-c" "fastfetch; exec $SHELL"
+spawn-at-startup "kitty" "-o" "background_opacity=0" "sh" "-c" "ls -la --color=always /usr/lib; exec $SHELL"
+
+window-rule {
+    match app-id="^kitty$"
+    match app-id="^com\\.mitchellh\\.ghostty$"
+
+    background-effect {
+        blur true
+    }
+
+    // FROZEN_GLASS_STAGE from the config's index.tsx.
+    shader "liquid-desktop/frozen-glass.frag" {
+        input "backdrop"
+        uniform "crystal_px" 170.0
+        uniform "refraction_px" 130.0
+        uniform "crack_width" 0.05
+        uniform "crack_intensity" 0.05
+        uniform "frost_amount" 0.2
+        uniform "frost_scale" 1.9
+        uniform "edge_frost" 0.0
+        uniform "edge_frost_px" 300.0
+        uniform "ice_tint" 0.65
+        uniform "ice_opacity" 0.85
+    }
+}

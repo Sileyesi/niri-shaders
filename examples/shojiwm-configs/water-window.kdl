@@ -1,0 +1,39 @@
+// The water of liquid-desktop on windows instead of the wallpaper: the pointer makes waves in the
+// blurred glass behind transparent terminals, under the sharp text, and Mod+I drops a stone where
+// the pointer is. water-flow.frag and water-surface.frag are the originals, unchanged.
+//
+//     examples/shojiwm-configs/run.sh water-window [wallpaper.png]
+
+include "common.kdl"
+
+spawn-at-startup "kitty" "-o" "background_opacity=0.3" "sh" "-c" "fastfetch; exec $SHELL"
+spawn-at-startup "kitty" "-o" "background_opacity=0.3"
+
+window-rule {
+    match app-id="^kitty$"
+    match app-id="^com\\.mitchellh\\.ghostty$"
+
+    background-effect {
+        blur true
+    }
+
+    // Like the wallpaper pipeline of liquid-desktop.kdl, but over the blurred backdrop of the
+    // window, and behind it. Every window has its own water, and for a window the pointer is
+    // relative to it.
+    shader-pipeline {
+        state "flow" scale=0.5
+        pass "liquid-desktop/water-flow.frag" target="flow" repeat=4
+        draw "liquid-desktop/water-surface.frag" input="backdrop" behind=true {
+            texture "flow" from="flow"
+            texture "sharp" from="backdrop"
+            uniform "emboss" 5
+            uniform "ripple_gain" 0.15
+            uniform "refraction_px" 14
+            uniform "reflection_gain" 1.2
+            uniform "reflection_cutoff" 0.25
+            uniform "reflection_intensity" 2.5
+            uniform "specular_strength" 0.35
+            uniform "water_tint" 0.94
+        }
+    }
+}

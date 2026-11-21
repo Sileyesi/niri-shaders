@@ -1,0 +1,34 @@
+// https://github.com/bea4dev/rainy-terminal-config-shojiwm in niri: rain on the blurred glass
+// behind the terminals. rain-terminal.frag is the original file, unchanged; it uses the older
+// ShojiWM API, where `tex` is the backdrop and niri feeds `time`.
+//
+//     examples/shojiwm-configs/run.sh rainy-terminal [wallpaper.png]
+
+include "common.kdl"
+
+spawn-at-startup "kitty" "-o" "background_opacity=0.35"
+spawn-at-startup "kitty" "-o" "background_opacity=0.35" "sh" "-c" "fastfetch; exec $SHELL"
+
+window-rule {
+    match app-id="^kitty$"
+    match app-id="^com\\.mitchellh\\.ghostty$"
+
+    background-effect {
+        blur true
+    }
+
+    // RAIN_SURFACE_UNIFORMS from the config's index.tsx.
+    shader "rainy-terminal/rain-terminal.frag" {
+        uniform "rain_density" 22.0
+        uniform "drop_chance" 0.72
+        uniform "ripple_speed" 0.42
+        uniform "ripple_size" 1.0
+        uniform "ripple_strength" 0.12
+        uniform "ripple_frequency" 31.0
+        uniform "ripple_decay" 2.0
+        uniform "refraction_strength" 1.0
+        uniform "highlight_intensity" 2.8
+        uniform "highlight_sharpness" 6.0
+        uniform "rain_tint" 0.94
+    }
+}

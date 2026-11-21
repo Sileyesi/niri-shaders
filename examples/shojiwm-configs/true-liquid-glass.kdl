@@ -1,0 +1,147 @@
+// https://github.com/bea4dev/true-liquid-glass-shojiwm in niri. The QuickShell bar of the config
+// (LiquidIslandQS, click it to split and merge the islands) gets the true liquid glass behind it:
+// a distance field to the edge of whatever shape the bar draws, built every frame by jump flooding
+// its alpha, bends the blurred backdrop like a thick lens. The terminals get liquid glass over the
+// blurred backdrop. All the .frag files are the originals, unchanged.
+//
+//     examples/shojiwm-configs/run.sh true-liquid-glass [wallpaper.png]
+//
+// The bar needs QuickShell and Qt 6 Shader Tools (qsb).
+
+include "common.kdl"
+
+// niri's blur behind a layer surface shows the wallpaper, not the windows. Keep the windows below
+// the bar, so that the glass has the wallpaper behind it, as it looks.
+layout {
+    struts {
+        top 300
+    }
+}
+
+spawn-sh-at-startup "cd \"$NIRI_SHOJIWM_DIR/true-liquid-glass/LiquidIslandQS\" && QSB=${QSB:-/usr/lib/qt6/bin/qsb} exec bash run.sh"
+spawn-at-startup "kitty" "-o" "background_opacity=0.35" "sh" "-c" "fastfetch; exec $SHELL"
+spawn-at-startup "kitty" "-o" "background_opacity=0.35"
+
+window-rule {
+    match app-id="^kitty$"
+    match app-id="^com\\.mitchellh\\.ghostty$"
+
+    background-effect {
+        blur true
+    }
+
+    // The parameters of the config's index.tsx.
+    shader "true-liquid-glass/liquid-glass.frag" {
+        input "backdrop"
+        uniform "glass_radius_px" 10.0
+        uniform "distortion_depth" 0.2
+        uniform "distortion_strength" 0.15
+        uniform "chromatic_shift_px" 3.0
+        uniform "glass_tint" 0.9
+    }
+}
+
+// ISLAND_GLASS from the config's island-glass.ts, pass by pass. Its sharp, soft and edge scenes
+// are all niri's blur of the backdrop here; with blurMix 1 the config shows only the blurred ones
+// anyway.
+layer-rule {
+    match namespace="^liquid-island-qs$"
+
+    background-effect {
+        blur true
+    }
+
+    shader-pipeline {
+        state "mask"
+        state "seed_x"
+        state "seed_mask"
+        state "step"
+        state "distance"
+
+        pass "true-liquid-glass/island-mask.frag" target="mask" {
+            texture "layer_mask" from="surface"
+            uniform "alpha_threshold" 0.10
+            uniform "alpha_feather" 0.02
+        }
+        // Prefilter the silhouette before picking the seeds.
+        pass "true-liquid-glass/island-smooth.frag" target="seed_x" {
+            texture "field_input" from="mask"
+            uniform "axis" 1 0
+            uniform "smoothing_px" 1
+        }
+        pass "true-liquid-glass/island-smooth.frag" target="seed_mask" {
+            texture "field_input" from="seed_x"
+            uniform "axis" 0 1
+            uniform "smoothing_px" 1
+        }
+        pass "true-liquid-glass/island-seed.frag" target="step" {
+            texture "mask_input" from="seed_mask"
+        }
+        // Jump flooding.
+        pass "true-liquid-glass/island-jump.frag" target="step" {
+            texture "field_input" from="step"
+            uniform "jump_px" 64
+        }
+        pass "true-liquid-glass/island-jump.frag" target="step" {
+            texture "field_input" from="step"
+            uniform "jump_px" 32
+        }
+        pass "true-liquid-glass/island-jump.frag" target="step" {
+            texture "field_input" from="step"
+            uniform "jump_px" 16
+        }
+        pass "true-liquid-glass/island-jump.frag" target="step" {
+            texture "field_input" from="step"
+            uniform "jump_px" 8
+        }
+        pass "true-liquid-glass/island-jump.frag" target="step" {
+            texture "field_input" from="step"
+            uniform "jump_px" 4
+        }
+        pass "true-liquid-glass/island-jump.frag" target="step" {
+            texture "field_input" from="step"
+            uniform "jump_px" 2
+        }
+        pass "true-liquid-glass/island-jump.frag" target="step" {
+            texture "field_input" from="step"
+            uniform "jump_px" 1
+        }
+        pass "true-liquid-glass/island-jump.frag" target="step" {
+            texture "field_input" from="step"
+            uniform "jump_px" 1
+        }
+        pass "true-liquid-glass/island-height.frag" target="step" {
+            texture "silhouette" from="seed_mask"
+            texture "field_input" from="step"
+            uniform "distance_limit_px" 120
+        }
+        pass "true-liquid-glass/island-smooth.frag" target="step" {
+            texture "field_input" from="step"
+            uniform "axis" 1 0
+            uniform "smoothing_px" 3
+        }
+        pass "true-liquid-glass/island-smooth.frag" target="distance" {
+            texture "field_input" from="step"
+            uniform "axis" 0 1
+            uniform "smoothing_px" 3
+        }
+
+        // ISLAND_GLASS_OPTIONS.
+        draw "true-liquid-glass/island-refract.frag" input="backdrop" behind=true {
+            texture "sharp_scene" from="backdrop"
+            texture "soft_scene" from="backdrop"
+            texture "edge_scene" from="backdrop"
+            texture "silhouette" from="mask"
+            texture "distance_field" from="distance"
+            uniform "rim_width_px" 30
+            uniform "refraction_px" 30
+            uniform "chromatic_shift_px" 0.9
+            uniform "highlight_strength" 1.0
+            uniform "debug_view" 0
+            uniform "blur_mix" 1
+            uniform "edge_softness_px" 2
+            uniform "bevel_width_px" 10
+            uniform "bevel_shadow" 0
+        }
+    }
+}

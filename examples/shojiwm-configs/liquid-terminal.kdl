@@ -1,0 +1,35 @@
+// https://github.com/bea4dev/liquid-terminal-config-shojiwm in niri: water running across the
+// blurred glass behind the terminals, under the sharp text. water-terminal.frag is the original
+// file, unchanged; the config ships the same one as rainy-terminal. It uses the older ShojiWM API,
+// where `tex` is the backdrop and niri feeds `time`.
+//
+//     examples/shojiwm-configs/run.sh liquid-terminal [wallpaper.png]
+
+include "common.kdl"
+
+spawn-at-startup "kitty" "-o" "background_opacity=0.1" "sh" "-c" "fastfetch; exec $SHELL"
+spawn-at-startup "kitty" "-o" "background_opacity=0.1"
+
+window-rule {
+    match app-id="^kitty$"
+    match app-id="^com\\.mitchellh\\.ghostty$"
+
+    background-effect {
+        blur true
+    }
+
+    // WATER_SURFACE_UNIFORMS from the config's index.tsx.
+    shader "rainy-terminal/water-terminal.frag" {
+        uniform "wave_speed" 0.2
+        uniform "wave_speed_x" 0.3
+        uniform "wave_speed_y" 0.3
+        uniform "emboss" 0.5
+        uniform "intensity" 2.4
+        uniform "frequency" 6.0
+        uniform "refraction_strength" 2.0
+        uniform "reflection_gain" 700.0
+        uniform "reflection_cutoff" 0.012
+        uniform "reflection_intensity" 200000.0
+        uniform "water_tint" 0.92
+    }
+}

@@ -1,0 +1,93 @@
+// What the three ShojiWM configs share: dual kawase blur with radius 4 and 2 passes, a 2 px border
+// that is gold when focused and gray otherwise, corners of radius 10, and blur behind layer
+// surfaces (except the "no_blur" namespace) and their pop-ups.
+
+prefer-no-csd
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+blur {
+    passes 2
+    offset 4
+    noise 0
+    saturation 1
+}
+
+layout {
+    gaps 12
+    default-column-width { proportion 0.5; }
+
+    focus-ring {
+        off
+    }
+
+    border {
+        on
+        width 2
+        active-color "#d7ba7d"
+        inactive-color "#4f5666"
+    }
+}
+
+screenshot-path "~/Pictures/Screenshots/niri-shojiwm %Y-%m-%d %H-%M-%S.png"
+
+spawn-sh-at-startup "[ -n \"$NIRI_DEMO_WALLPAPER\" ] && exec swaybg -i \"$NIRI_DEMO_WALLPAPER\" -m fill"
+
+window-rule {
+    geometry-corner-radius 10
+    clip-to-geometry true
+    // Otherwise niri fills the tile behind the window with the border color, which shows through
+    // transparent terminals.
+    draw-border-with-background false
+}
+
+layer-rule {
+    exclude namespace="^no_blur$"
+    // Nothing is behind the wallpaper.
+    exclude layer="background"
+
+    background-effect {
+        blur true
+    }
+
+    popups {
+        background-effect {
+            blur true
+        }
+    }
+}
+
+binds {
+    Mod+Shift+S { cycle-window-shader; }
+    // Drops a stone into the water of liquid-desktop at the pointer, like Super+I there.
+    Mod+I { shader-pipeline-splash; }
+
+    Mod+Shift+Slash { show-hotkey-overlay; }
+    Mod+T { spawn "kitty" "-o" "background_opacity=0.1"; }
+    Mod+D { spawn "fuzzel"; }
+    Mod+Q { close-window; }
+    Mod+O { toggle-overview; }
+    Mod+Shift+E { quit; }
+
+    Mod+Left  { focus-column-left; }
+    Mod+Right { focus-column-right; }
+    Mod+Up    { focus-window-up; }
+    Mod+Down  { focus-window-down; }
+    Mod+H     { focus-column-left; }
+    Mod+L     { focus-column-right; }
+    Mod+K     { focus-window-up; }
+    Mod+J     { focus-window-down; }
+
+    Mod+Shift+Left  { move-column-left; }
+    Mod+Shift+Right { move-column-right; }
+
+    Mod+V { toggle-window-floating; }
+    Mod+F { maximize-column; }
+    Mod+Shift+F { fullscreen-window; }
+    Mod+R { switch-preset-column-width; }
+
+    Print { screenshot; }
+    Mod+Shift+P { screenshot-screen; }
+}
