@@ -1,3 +1,67 @@
+# niri with window shaders
+
+A fork of [niri](https://github.com/niri-wm/niri) that draws windows, layer surfaces and their backgrounds through your own fragment shaders.
+Point a window rule at a `.frag` file, save the file, and the window changes within a second.
+
+![Two terminals with the thaw preset: the one that takes the focus melts, the other one freezes over, and closing shatters it](docs/media/thaw.gif)
+
+```kdl
+window-rule {
+    match app-id="^kitty$"
+    shader "preset:thaw"
+}
+```
+
+What a shader here knows about its window, and a client or another compositor's shader doesn't:
+whether the window has the focus and since when, where the pointer is over it, what's behind it (niri's blur), how far its close animation is, and its size, corners and border.
+The `thaw` preset uses all of it: windows out of focus are frozen, the focus melts them from the pointer, and closing shatters them.
+
+- **Window shaders**: the `shader` window rule takes a file, a preset or inline code, with uniforms from the config or tied to the clock.
+  Presets: `thaw`, `island-glass`, `rain`, `crt`, `hologram`, `matrix`, `glitch`, `neon-edge`, `ripple` and `dissolve` for closing.
+- **Shaders from ShojiWM** run unchanged: its effect shaders, over the window or over what's behind it, and its decoration shaders.
+- **Shader pipelines**: several passes with textures that keep their contents between frames, on layer surfaces and windows, for things like water that follows the pointer.
+- **On the fly**: `niri msg window-shader set|clear|list`, and the `cycle-window-shader` action. A shader that doesn't compile leaves the window as it was and shows the compiler error in `niri msg window-shader list`.
+- **Title bars** for floating windows, with `floating-titlebars` in the layout.
+
+Everything is in [docs/SHADERS.md](docs/SHADERS.md).
+
+## Videos
+
+| | |
+|---|---|
+| [thaw.mp4](docs/media/thaw.mp4) | The focus melts the ice, closing shatters it. |
+| [presets.mp4](docs/media/presets.mp4) | `crt`, `hologram`, `matrix`, `glitch`, `neon-edge`, and `dissolve` on closing. |
+| [glass.mp4](docs/media/glass.mp4) | `island-glass` and `rain` over a see-through terminal. |
+| [shojiwm.mp4](docs/media/shojiwm.mp4) | Frozen glass and water from bea4dev's ShojiWM configs, unchanged. |
+| [live-edit.mp4](docs/media/live-edit.mp4) | A shader edited while the window shows it. |
+
+## Trying it
+
+```sh
+cargo build --release
+# Without libclang, build without screencasting:
+cargo build --release --no-default-features --features dbus,systemd
+
+# Six windows with their own shaders, in a window of your current session (there the Mod key is Alt):
+examples/demo.sh ~/Pictures/some-wallpaper.png
+# bea4dev's ShojiWM configs, in niri:
+examples/shojiwm-configs/run.sh frozen-desktop ~/Pictures/some-wallpaper.png
+```
+
+[niri-showcase](https://github.com/Sileyesi/niri-showcase) is a whole desktop built on this fork: a QuickShell bar, dock and launcher on liquid glass, and workspaces full of windows drawn through shaders.
+[docs/SHELLS.md](docs/SHELLS.md) is about the shells, launchers and terminals that go well with the shaders, and what to set in them.
+[`examples/shojiwm-configs/`](examples/shojiwm-configs/) runs five ShojiWM configs by bea4dev in niri.
+
+## Credits
+
+- [niri](https://github.com/niri-wm/niri) by YaLTeR and its contributors, GPL-3.0-or-later like this fork.
+- [ShojiWM](https://github.com/bea4dev/ShojiWM) by bea4dev, MIT: the `island-glass` and `dissolve` presets start from its shaders, as their headers say.
+- The shaders in `examples/shojiwm-configs/` come from bea4dev's ShojiWM configs, which have no license; see [its NOTICE](examples/shojiwm-configs/NOTICE.md).
+
+The rest of this README is niri's own.
+
+---
+
 <h1 align="center"><img alt="niri" src="https://github.com/user-attachments/assets/07d05cd0-d5dc-4a28-9a35-51bae8f119a0"></h1>
 <p align="center">A scrollable-tiling Wayland compositor.</p>
 <p align="center">
