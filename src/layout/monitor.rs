@@ -1595,6 +1595,18 @@ impl<W: LayoutElement> Monitor<W> {
         ws.titlebar_under(pos_within_output - geo.loc)
     }
 
+    pub fn floating_edge_under(
+        &self,
+        pos_within_output: Point<f64, Logical>,
+    ) -> Option<(&W, ResizeEdge)> {
+        if self.overview_progress.is_some() {
+            return None;
+        }
+
+        let (ws, geo) = self.workspace_under(pos_within_output)?;
+        ws.floating_edge_under(pos_within_output - geo.loc)
+    }
+
     pub fn resize_edges_under(&self, pos_within_output: Point<f64, Logical>) -> Option<ResizeEdge> {
         if self.overview_progress.is_some() {
             return None;

@@ -39,6 +39,7 @@ const MAXIMIZE_COLOR: (f64, f64, f64) = (0.157, 0.784, 0.251);
 pub enum TitleBarPart {
     /// The title, which moves the window.
     Title,
+    Minimize,
     Maximize,
     Close,
 }
@@ -74,11 +75,11 @@ impl TitleBarPart {
             return None;
         }
 
-        // The buttons go close, minimize, maximize from the left. niri doesn't minimize windows,
-        // so that button is only there for the looks.
+        // The buttons go close, minimize, maximize from the left.
         let button = ((pos.x - (FIRST_BUTTON_X - BUTTON_STEP / 2.)) / BUTTON_STEP).floor();
         Some(match button {
             0. => Self::Close,
+            1. => Self::Minimize,
             2. => Self::Maximize,
             _ => Self::Title,
         })
@@ -189,7 +190,7 @@ fn draw(state: &TitleBarState, w: i32, h: i32, scale: f64) -> anyhow::Result<Vec
     // The buttons. They have their colors on the active window, or when the pointer is on them.
     let hovered = matches!(
         state.hovered,
-        Some(TitleBarPart::Close | TitleBarPart::Maximize)
+        Some(TitleBarPart::Close | TitleBarPart::Minimize | TitleBarPart::Maximize)
     );
     let lit = state.active || hovered;
     let radius = BUTTON_SIZE / 2. * scale;
@@ -197,8 +198,7 @@ fn draw(state: &TitleBarState, w: i32, h: i32, scale: f64) -> anyhow::Result<Vec
     let center = |i: f64| ((FIRST_BUTTON_X + BUTTON_STEP * i) * scale).round();
     let buttons = [
         (CLOSE_COLOR, lit),
-        // niri doesn't minimize windows, so this one stays gray, like disabled buttons on macOS.
-        (MINIMIZE_COLOR, false),
+        (MINIMIZE_COLOR, lit),
         (MAXIMIZE_COLOR, lit),
     ];
     for (i, (color, colored)) in buttons.into_iter().enumerate() {
@@ -228,6 +228,12 @@ fn draw(state: &TitleBarState, w: i32, h: i32, scale: f64) -> anyhow::Result<Vec
         cr.line_to(cx + glyph, cy + glyph);
         cr.move_to(cx + glyph, cy - glyph);
         cr.line_to(cx - glyph, cy + glyph);
+        cr.stroke()?;
+
+        // A dash.
+        let cx = center(1.);
+        cr.move_to(cx - glyph * 1.2, cy);
+        cr.line_to(cx + glyph * 1.2, cy);
         cr.stroke()?;
 
         // Two triangles in opposite corners, pointing out, or in when the window fills the

@@ -243,6 +243,8 @@ pub trait LayoutElement {
     fn set_activated(&mut self, active: bool);
     fn set_active_in_column(&mut self, active: bool);
     fn set_floating(&mut self, floating: bool);
+    /// Tells the window whether it is minimized, for IPC.
+    fn set_minimized(&mut self, _minimized: bool) {}
     fn set_bounds(&self, bounds: Size<i32, Logical>);
     fn is_ignoring_opacity_window_rule(&self) -> bool;
 
@@ -2450,6 +2452,19 @@ impl<W: LayoutElement> Layout<W> {
         mon.titlebar_under(pos_within_output)
     }
 
+    /// The floating window whose edge is under the point, for resizing it with the left button.
+    pub fn floating_edge_under(
+        &self,
+        output: &Output,
+        pos_within_output: Point<f64, Logical>,
+    ) -> Option<(&W, ResizeEdge)> {
+        if self.interactive_move.is_some() {
+            return None;
+        }
+        let mon = self.monitor_for_output(output)?;
+        mon.floating_edge_under(pos_within_output)
+    }
+
     /// Makes a floating window fill the working area, or puts it back, like the maximize button
     /// of its title bar.
     pub fn toggle_window_fill(&mut self, id: &W::Id) {
@@ -3305,6 +3320,27 @@ impl<W: LayoutElement> Layout<W> {
         for ws in self.workspaces_mut() {
             ws.set_all_windows_floating(floating);
         }
+    }
+
+    /// Minimizes a floating window, the focused one when `window` is `None`. Activating the window
+    /// brings it back.
+    pub fn minimize_window(&mut self, window: Option<&W::Id>) {
+        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            if window.is_none() || window == Some(move_.tile.window().id()) {
+                return;
+            }
+        }
+
+        let workspace = if let Some(window) = window {
+            self.workspaces_mut().find(|ws| ws.has_window(window))
+        } else {
+            self.active_workspace_mut()
+        };
+
+        let Some(workspace) = workspace else {
+            return;
+        };
+        workspace.minimize_window(window);
     }
 
     pub fn set_window_floating(&mut self, window: Option<&W::Id>, floating: bool) {

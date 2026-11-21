@@ -409,6 +409,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.tiles.iter().position(|tile| tile.window().id() == id)
     }
 
+    #[cfg(test)]
     fn contains(&self, id: &W::Id) -> bool {
         self.idx_of(id).is_some()
     }
@@ -549,12 +550,19 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let data = self.data.remove(idx);
         tile.is_floating = false;
         tile.floating_restore = None;
+        tile.clear_minimized();
 
         if self.tiles.is_empty() {
             self.active_window_id = None;
         } else if Some(tile.window().id()) == self.active_window_id.as_ref() {
-            // The active tile was removed, make the topmost tile active.
-            self.active_window_id = Some(self.tiles[0].window().id().clone());
+            // The active tile was removed, make the topmost tile active, preferring the ones that
+            // aren't minimized.
+            let next = self
+                .tiles
+                .iter()
+                .find(|tile| !tile.is_minimized())
+                .unwrap_or(&self.tiles[0]);
+            self.active_window_id = Some(next.window().id().clone());
         }
 
         // Stop interactive resize.
@@ -595,16 +603,22 @@ impl<W: LayoutElement> FloatingSpace<W> {
             return;
         };
 
+        // A minimized window is already out of sight.
+        if tile.is_minimized() {
+            return;
+        }
+
         let tile_size = tile.tile_size();
 
         self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
     }
 
     pub fn activate_window_without_raising(&mut self, id: &W::Id) -> bool {
-        if !self.contains(id) {
+        let Some(idx) = self.idx_of(id) else {
             return false;
-        }
+        };
 
+        self.restore_if_minimized(idx);
         self.active_window_id = Some(id.clone());
         true
     }
@@ -614,11 +628,61 @@ impl<W: LayoutElement> FloatingSpace<W> {
             return false;
         };
 
+        self.restore_if_minimized(idx);
         self.raise_window(idx, 0);
         self.active_window_id = Some(id.clone());
         self.bring_up_descendants_of(0);
 
         true
+    }
+
+    /// Where minimized windows go, the dock in the middle of the bottom edge, relative to the
+    /// center of the tile.
+    fn minimize_target(&self, idx: usize) -> Point<f64, Logical> {
+        let data = &self.data[idx];
+        let center = data.logical_pos + data.size.downscale(2.).to_point();
+        Point::from((self.view_size.w / 2., self.view_size.h)) - center
+    }
+
+    fn restore_if_minimized(&mut self, idx: usize) {
+        if self.tiles[idx].is_minimized() {
+            let target = self.minimize_target(idx);
+            self.tiles[idx].set_minimized(false, target);
+        }
+    }
+
+    /// Minimizes a window, and gives the focus to the topmost window still in sight.
+    pub fn minimize_window(&mut self, id: &W::Id) -> bool {
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+        if self.tiles[idx].is_minimized() {
+            return false;
+        }
+
+        if self
+            .interactive_resize
+            .as_ref()
+            .is_some_and(|resize| &resize.window == id)
+        {
+            self.interactive_resize = None;
+        }
+
+        let target = self.minimize_target(idx);
+        self.tiles[idx].set_minimized(true, target);
+
+        if self.active_window_id.as_ref() == Some(id) {
+            if let Some(tile) = self.tiles.iter().find(|tile| !tile.is_minimized()) {
+                self.active_window_id = Some(tile.window().id().clone());
+            }
+        }
+
+        true
+    }
+
+    /// Whether any window isn't minimized.
+    pub fn has_visible_windows(&self) -> bool {
+        self.tiles.iter().any(|tile| !tile.is_minimized())
     }
 
     fn raise_window(&mut self, from_idx: usize, to_idx: usize) {
@@ -885,7 +949,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let center = self.data[active_idx].center();
 
         let result = zip(&self.tiles, &self.data)
-            .filter(|(tile, _)| tile.window().id() != active_id)
+            .filter(|(tile, _)| tile.window().id() != active_id && !tile.is_minimized())
             .map(|(tile, data)| (tile, distance(center, data.center())))
             .filter(|(_, dist)| *dist > 0.)
             .min_by(|(_, dist_a), (_, dist_b)| f64::total_cmp(dist_a, dist_b));
@@ -917,6 +981,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn focus_leftmost(&mut self) {
         let result = self
             .tiles_with_offsets()
+            .filter(|(tile, _)| !tile.is_minimized())
             .min_by(|(_, pos_a), (_, pos_b)| f64::total_cmp(&pos_a.x, &pos_b.x));
         if let Some((tile, _)) = result {
             let id = tile.window().id().clone();
@@ -927,6 +992,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn focus_rightmost(&mut self) {
         let result = self
             .tiles_with_offsets()
+            .filter(|(tile, _)| !tile.is_minimized())
             .max_by(|(_, pos_a), (_, pos_b)| f64::total_cmp(&pos_a.x, &pos_b.x));
         if let Some((tile, _)) = result {
             let id = tile.window().id().clone();
@@ -937,6 +1003,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn focus_topmost(&mut self) {
         let result = self
             .tiles_with_offsets()
+            .filter(|(tile, _)| !tile.is_minimized())
             .min_by(|(_, pos_a), (_, pos_b)| f64::total_cmp(&pos_a.y, &pos_b.y));
         if let Some((tile, _)) = result {
             let id = tile.window().id().clone();
@@ -947,6 +1014,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn focus_bottommost(&mut self) {
         let result = self
             .tiles_with_offsets()
+            .filter(|(tile, _)| !tile.is_minimized())
             .max_by(|(_, pos_a), (_, pos_b)| f64::total_cmp(&pos_a.y, &pos_b.y));
         if let Some((tile, _)) = result {
             let id = tile.window().id().clone();
@@ -1249,12 +1317,14 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let active = self.active_window_id.clone();
         let bounds_area = self.bounds_area();
         for tile in &mut self.tiles {
+            let minimized = tile.is_minimized();
             let win = tile.window_mut();
 
             win.set_active_in_column(true);
             win.set_floating(true);
+            win.set_minimized(minimized);
 
-            let mut is_active = is_active && Some(win.id()) == active.as_ref();
+            let mut is_active = is_active && Some(win.id()) == active.as_ref() && !minimized;
             if self.options.deactivate_unfocused_windows {
                 is_active &= is_focused;
             }

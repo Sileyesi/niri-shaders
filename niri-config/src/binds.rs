@@ -499,6 +499,9 @@ pub enum Action {
     #[knuffel(skip)]
     MoveWindowToTilingById(u64),
     ToggleAllWindowsFloating,
+    MinimizeWindow,
+    #[knuffel(skip)]
+    MinimizeWindowById(u64),
     FocusFloating,
     FocusTiling,
     SwitchFocusBetweenFloatingAndTiling,
@@ -877,6 +880,8 @@ impl From<niri_ipc::Action> for Action {
                 Self::MoveWindowToTilingById(id)
             }
             niri_ipc::Action::ToggleAllWindowsFloating {} => Self::ToggleAllWindowsFloating,
+            niri_ipc::Action::MinimizeWindow { id: None } => Self::MinimizeWindow,
+            niri_ipc::Action::MinimizeWindow { id: Some(id) } => Self::MinimizeWindowById(id),
             niri_ipc::Action::FocusFloating {} => Self::FocusFloating,
             niri_ipc::Action::FocusTiling {} => Self::FocusTiling,
             niri_ipc::Action::SwitchFocusBetweenFloatingAndTiling {} => {

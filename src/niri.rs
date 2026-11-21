@@ -193,7 +193,7 @@ use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
     center, center_f64, get_monotonic_time, ipc_transform_to_smithay, is_mapped, logical_output,
     make_screenshot_path, output_matches_name, output_size, panel_orientation,
-    send_scale_transform, winit_scale, write_png_rgba8, xwayland,
+    send_scale_transform, winit_scale, write_png_rgba8, xwayland, ResizeEdge,
 };
 use crate::window::mapped::{MappedId, WindowCastRenderElements};
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
@@ -613,6 +613,8 @@ pub struct PointContents {
     pub hot_corner: bool,
     // Point is over the overview.
     pub overview: bool,
+    // Point is over the edge of a floating window, which the left button resizes.
+    pub resize_edge: Option<(Window, ResizeEdge)>,
 }
 
 #[derive(Debug, Default)]
@@ -1062,6 +1064,7 @@ impl State {
             under = PointContents::default();
         }
 
+        let was_on_edge = self.niri.pointer_contents.resize_edge.is_some();
         self.niri.pointer_contents.clone_from(&under);
         self.niri.update_window_shader_pointer(location);
 
@@ -1076,6 +1079,7 @@ impl State {
             },
         );
         pointer.frame(self);
+        self.niri.update_floating_edge_cursor(was_on_edge);
 
         self.niri.maybe_activate_pointer_constraint();
 
@@ -1295,18 +1299,21 @@ impl State {
             }
         }
 
+        let was_on_edge = self.niri.pointer_contents.resize_edge.is_some();
         self.niri.pointer_contents.clone_from(&under);
         self.niri.update_window_shader_pointer(location);
 
         pointer.motion(
             self,
-            under.surface,
+            under.surface.clone(),
             &MotionEvent {
                 location,
                 serial: SERIAL_COUNTER.next_serial(),
                 time: InputTime::now(),
             },
         );
+
+        self.niri.update_floating_edge_cursor(was_on_edge);
 
         self.niri.maybe_activate_pointer_constraint();
 
@@ -3861,6 +3868,16 @@ impl Niri {
 
             under = under.or_else(interactive_moved_window_under);
 
+            // The edges of floating windows stick out of them a little, over what's below.
+            if under.is_none() && !is_overview_open {
+                if let Some((mapped, edges)) =
+                    self.layout.floating_edge_under(output, pos_within_output)
+                {
+                    rv.resize_edge = Some((mapped.window.clone(), edges));
+                    return rv;
+                }
+            }
+
             if !is_overview_open {
                 under = under
                     .or_else(|| layer_popup_under(Layer::Bottom))
@@ -4091,6 +4108,24 @@ impl Niri {
 
         let state = self.output_state.get(output)?;
         state.lock_surface.as_ref().map(|s| s.wl_surface()).cloned()
+    }
+
+    /// Shows the resize cursor over the edges of floating windows, outside of any surface, where
+    /// nothing else sets the cursor, and puts the default one back once the pointer leaves them.
+    pub fn update_floating_edge_cursor(&mut self, was_on_edge: bool) {
+        if self.seat.get_pointer().unwrap().is_grabbed() {
+            return;
+        }
+
+        if let Some((_, edges)) = &self.pointer_contents.resize_edge {
+            self.cursor_manager
+                .set_cursor_image(CursorImageStatus::Named(edges.cursor_icon()));
+            self.queue_redraw_all();
+        } else if was_on_edge && self.pointer_contents.surface.is_none() {
+            self.cursor_manager
+                .set_cursor_image(CursorImageStatus::default_named());
+            self.queue_redraw_all();
+        }
     }
 
     /// Tells the window under the pointer where the pointer is, for window shaders.

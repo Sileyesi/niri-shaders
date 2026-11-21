@@ -769,12 +769,13 @@ impl<W: LayoutElement> Workspace<W> {
 
     fn update_focus_floating_tiling_after_removing(&mut self, removed_from_floating: bool) {
         if removed_from_floating {
-            if self.floating.is_empty() {
+            if !self.floating.has_visible_windows() {
                 self.floating_is_active = FloatingActive::No;
             }
         } else {
-            // Scrolling should remain focused if both are empty.
-            if self.scrolling.is_empty() && !self.floating.is_empty() {
+            // Scrolling should remain focused if both are empty, or floating has only minimized
+            // windows.
+            if self.scrolling.is_empty() && self.floating.has_visible_windows() {
                 self.floating_is_active = FloatingActive::Yes;
             }
         }
@@ -1559,6 +1560,23 @@ impl<W: LayoutElement> Workspace<W> {
         self.toggle_window_floating(id);
     }
 
+    /// Minimizes a floating window, the active one when `id` is `None`. When no floating window is
+    /// left in sight, the focus goes to tiling.
+    pub fn minimize_window(&mut self, id: Option<&W::Id>) {
+        let id = match id {
+            Some(id) => id.clone(),
+            None if self.floating_is_active.get() => match self.floating.active_window() {
+                Some(win) => win.id().clone(),
+                None => return,
+            },
+            None => return,
+        };
+
+        if self.floating.minimize_window(&id) && !self.floating.has_visible_windows() {
+            self.floating_is_active = FloatingActive::No;
+        }
+    }
+
     pub fn focus_floating(&mut self) {
         if !self.floating_is_active.get() {
             self.switch_focus_floating_tiling();
@@ -1572,7 +1590,7 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn switch_focus_floating_tiling(&mut self) {
-        if self.floating.is_empty() {
+        if !self.floating.has_visible_windows() {
             // If floating is empty, keep focus on scrolling.
             return;
         } else if self.scrolling.is_empty() {
@@ -1899,6 +1917,73 @@ impl<W: LayoutElement> Workspace<W> {
                 )
             })
             .flatten()
+    }
+
+    /// The floating window whose edge is under the point, and which edges to resize it by: a band
+    /// just around the window and a few pixels into it, wider at the corners.
+    pub fn floating_edge_under(&self, pos: Point<f64, Logical>) -> Option<(&W, ResizeEdge)> {
+        const OUTSIDE: f64 = 8.;
+        const INSIDE: f64 = 3.;
+        const CORNER: f64 = 16.;
+
+        if !self.is_floating_visible() {
+            return None;
+        }
+
+        // From the top, so a window covers the edges of the ones below it.
+        for (tile, tile_pos) in self.floating.tiles_with_render_positions() {
+            if tile.is_minimized() {
+                continue;
+            }
+
+            let p = pos - tile_pos;
+            let size = tile.tile_size();
+
+            let inner = Rectangle::new(
+                Point::from((INSIDE, INSIDE)),
+                Size::from((size.w - INSIDE * 2., size.h - INSIDE * 2.)),
+            );
+            if inner.contains(p) {
+                return None;
+            }
+            let outer = Rectangle::new(
+                Point::from((-OUTSIDE, -OUTSIDE)),
+                Size::from((size.w + OUTSIDE * 2., size.h + OUTSIDE * 2.)),
+            );
+            if !outer.contains(p) {
+                continue;
+            }
+
+            let mut edges = ResizeEdge::empty();
+            if p.x < INSIDE {
+                edges |= ResizeEdge::LEFT;
+            } else if size.w - INSIDE <= p.x {
+                edges |= ResizeEdge::RIGHT;
+            }
+            if p.y < INSIDE {
+                edges |= ResizeEdge::TOP;
+            } else if size.h - INSIDE <= p.y {
+                edges |= ResizeEdge::BOTTOM;
+            }
+            if edges.intersects(ResizeEdge::LEFT_RIGHT) {
+                if p.y < CORNER {
+                    edges |= ResizeEdge::TOP;
+                } else if size.h - CORNER <= p.y {
+                    edges |= ResizeEdge::BOTTOM;
+                }
+            }
+            if edges.intersects(ResizeEdge::TOP_BOTTOM) {
+                if p.x < CORNER {
+                    edges |= ResizeEdge::LEFT;
+                } else if size.w - CORNER <= p.x {
+                    edges |= ResizeEdge::RIGHT;
+                }
+            }
+
+            return Some((tile.window(), edges));
+        }
+
+        None
     }
 
     pub fn toggle_window_fill(&mut self, id: &W::Id) {

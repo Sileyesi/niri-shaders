@@ -2516,6 +2516,19 @@ impl State {
                 // FIXME: granular
                 self.niri.queue_redraw_all();
             }
+            Action::MinimizeWindow => {
+                self.niri.layout.minimize_window(None);
+                // FIXME: granular
+                self.niri.queue_redraw_all();
+            }
+            Action::MinimizeWindowById(id) => {
+                let id = MappedId::specific(id);
+                if let Some(window) = self.niri.find_window_by_id(id) {
+                    self.niri.layout.minimize_window(Some(&window));
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
             Action::FocusFloating => {
                 self.niri.layout.focus_floating();
                 self.maybe_warp_cursor_to_focus();
@@ -3022,6 +3035,7 @@ impl State {
 
         self.niri.handle_focus_follows_mouse(&under);
 
+        let was_on_edge = self.niri.pointer_contents.resize_edge.is_some();
         self.niri.pointer_contents.clone_from(&under);
         self.niri.update_window_shader_pointer(new_pos);
 
@@ -3034,6 +3048,7 @@ impl State {
                 time: event.time(),
             },
         );
+        self.niri.update_floating_edge_cursor(was_on_edge);
 
         pointer.relative_motion(
             self,
@@ -3124,6 +3139,7 @@ impl State {
 
         self.niri.handle_focus_follows_mouse(&under);
 
+        let was_on_edge = self.niri.pointer_contents.resize_edge.is_some();
         self.niri.pointer_contents.clone_from(&under);
         self.niri.update_window_shader_pointer(pos);
 
@@ -3136,6 +3152,7 @@ impl State {
                 time: event.time(),
             },
         );
+        self.niri.update_floating_edge_cursor(was_on_edge);
 
         pointer.frame(self);
 
@@ -3364,6 +3381,39 @@ impl State {
                 }
             }
 
+            // The edges of floating windows resize them with the left button.
+            let edge = self.niri.pointer_contents.resize_edge.clone().filter(|_| {
+                button == Some(MouseButton::Left)
+                    && !pointer.is_grabbed()
+                    && !is_overview_open
+                    && !mod_down
+            });
+            if let Some((window, edges)) = edge {
+                self.niri.layout.activate_window(&window);
+
+                if self
+                    .niri
+                    .layout
+                    .interactive_resize_begin(window.clone(), edges)
+                {
+                    let start_data = PointerGrabStartData {
+                        focus: None,
+                        button: button_code,
+                        location: pointer.current_location(),
+                    };
+                    let start_data = AnyStartData::Pointer(start_data);
+                    let grab = ResizeGrab::new(start_data, window);
+                    pointer.set_grab(self, grab, serial, Focus::Clear);
+                    self.niri
+                        .cursor_manager
+                        .set_cursor_image(CursorImageStatus::Named(edges.cursor_icon()));
+                }
+
+                // FIXME: granular.
+                self.niri.queue_redraw_all();
+                return;
+            }
+
             if let Some(mapped) = self.niri.window_under_cursor() {
                 let window = mapped.window.clone();
 
@@ -3383,11 +3433,19 @@ impl State {
                 } else {
                     None
                 };
+                if titlebar == Some(TitleBarPart::Minimize) {
+                    self.niri.layout.minimize_window(Some(&window));
+                    self.niri.suppressed_buttons.insert(button_code);
+                    // FIXME: granular.
+                    self.niri.queue_redraw_all();
+                    return;
+                }
                 let titlebar_fill = match titlebar {
                     Some(TitleBarPart::Close) => {
                         mapped.toplevel().send_close();
                         false
                     }
+                    Some(TitleBarPart::Minimize) => false,
                     Some(TitleBarPart::Maximize) => true,
                     Some(TitleBarPart::Title) => mapped.titlebar_clicked(get_monotonic_time()),
                     None => false,

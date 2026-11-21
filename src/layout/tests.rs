@@ -3290,6 +3290,48 @@ fn toggle_all_windows_floating_floats_everything() {
 }
 
 #[test]
+fn minimize_floating_window_and_bring_it_back() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::ToggleAllWindowsFloating,
+    ];
+    let mut layout = check_ops(ops);
+
+    // The focus goes to the window still in sight.
+    layout.minimize_window(Some(&2));
+    let ws = layout.active_workspace().unwrap();
+    assert_eq!(ws.active_window().map(|win| *win.id()), Some(1));
+
+    // With nothing floating in sight, nothing floating has the focus.
+    layout.minimize_window(None);
+    let ws = layout.active_workspace().unwrap();
+    assert_eq!(ws.active_window().map(|win| *win.id()), None);
+    let (tile, pos, _) = ws.tiles_with_render_positions().next().unwrap();
+    assert!(tile.is_minimized());
+    let center = pos + tile.tile_size().downscale(2.).to_point();
+    assert!(ws.window_under(center).is_none());
+
+    // Activating a window brings it back.
+    layout.activate_window(&2);
+    let ws = layout.active_workspace().unwrap();
+    assert_eq!(ws.active_window().map(|win| *win.id()), Some(2));
+    assert!(ws.tiles().any(|tile| *tile.window().id() == 2 && !tile.is_minimized()));
+    layout.verify_invariants();
+
+    // Going back to tiling forgets minimizing.
+    layout.toggle_all_windows_floating();
+    assert!(layout
+        .workspaces()
+        .all(|(_, _, ws)| ws.tiles().all(|tile| !tile.is_minimized())));
+}
+
+#[test]
 fn set_width_fixed_negative() {
     let ops = [
         Op::AddOutput(3),

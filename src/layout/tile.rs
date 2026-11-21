@@ -8,6 +8,9 @@ use std::time::Duration;
 use niri_config::utils::MergeWith as _;
 use niri_config::{Color, CornerRadius, GradientInterpolation};
 use niri_ipc::WindowLayout;
+use smithay::backend::renderer::element::utils::{
+    Relocate, RelocateRenderElement, RescaleRenderElement,
+};
 use smithay::backend::renderer::element::{Element, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
@@ -124,6 +127,13 @@ pub struct Tile<W: LayoutElement> {
 
     /// The animation of the tile's opacity.
     pub(super) alpha_animation: Option<AlphaAnimation>,
+
+    /// Whether the floating tile is minimized: out of sight and out of the focus until it's
+    /// activated again.
+    minimized: bool,
+
+    /// The animation of the tile going down into the dock and coming back.
+    minimize_animation: Option<MinimizeAnimation>,
 
     /// Offset during the initial interactive move rubberband.
     pub(super) interactive_move_offset: Point<f64, Logical>,
@@ -245,6 +255,15 @@ struct MoveAnimation {
 }
 
 #[derive(Debug)]
+struct MinimizeAnimation {
+    /// 0 with the window in its place, 1 with the window down in the dock.
+    anim: Animation,
+    /// Where the window goes, from the center of the tile.
+    target: Point<f64, Logical>,
+    offscreen: OffscreenBuffer,
+}
+
+#[derive(Debug)]
 pub(super) struct AlphaAnimation {
     pub(super) anim: Animation,
     /// Whether the animation should persist after it's done.
@@ -293,6 +312,8 @@ impl<W: LayoutElement> Tile<W> {
             move_x_animation: None,
             move_y_animation: None,
             alpha_animation: None,
+            minimized: false,
+            minimize_animation: None,
             interactive_move_offset: Point::from((0., 0.)),
             unmap_snapshot: None,
             rounded_corner_damage: Default::default(),
@@ -532,6 +553,12 @@ impl<W: LayoutElement> Tile<W> {
                 self.alpha_animation = None;
             }
         }
+
+        if let Some(minimize) = &self.minimize_animation {
+            if minimize.anim.is_done() {
+                self.minimize_animation = None;
+            }
+        }
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
@@ -570,6 +597,7 @@ impl<W: LayoutElement> Tile<W> {
                 .alpha_animation
                 .as_ref()
                 .is_some_and(|alpha| !alpha.anim.is_done())
+            || self.minimize_animation.is_some()
     }
 
     pub fn is_moving_between_workspaces(&self) -> bool {
@@ -746,6 +774,46 @@ impl<W: LayoutElement> Tile<W> {
         offset += self.interactive_move_offset;
 
         offset
+    }
+
+    pub fn is_minimized(&self) -> bool {
+        self.minimized
+    }
+
+    /// Minimizes the tile or brings it back, with the window flying to or from `target`, relative
+    /// to the center of the tile.
+    pub fn set_minimized(&mut self, minimized: bool, target: Point<f64, Logical>) {
+        if self.minimized == minimized {
+            return;
+        }
+        self.minimized = minimized;
+
+        let to = if minimized { 1. } else { 0. };
+        let (from, offscreen) = match self.minimize_animation.take() {
+            Some(minimize) => (minimize.anim.value(), minimize.offscreen),
+            None => (1. - to, OffscreenBuffer::default()),
+        };
+
+        // Quick to start and long to settle, like the windows of macOS.
+        let config = niri_config::Animation {
+            off: self.options.animations.off,
+            kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+                duration_ms: if minimized { 420 } else { 480 },
+                curve: niri_config::animations::Curve::CubicBezier(0.32, 0.72, 0., 1.),
+            }),
+        };
+        self.minimize_animation = Some(MinimizeAnimation {
+            anim: Animation::new(self.clock.clone(), from, to, 0., config),
+            target,
+            offscreen,
+        });
+    }
+
+    /// Forgets that the tile was minimized, when it leaves the floating layout.
+    pub fn clear_minimized(&mut self) {
+        self.minimized = false;
+        self.minimize_animation = None;
+        self.window.set_minimized(false);
     }
 
     pub fn start_open_animation(&mut self) {
@@ -1150,6 +1218,10 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn hit(&self, point: Point<f64, Logical>) -> Option<HitType> {
+        if self.minimized {
+            return None;
+        }
+
         let offset = self.bob_offset();
         let point = point - offset;
 
@@ -1941,10 +2013,55 @@ impl<W: LayoutElement> Tile<W> {
             .as_ref()
             .map_or(1., |alpha| alpha.anim.clamped_value()) as f32;
 
+        if self.minimized && self.minimize_animation.is_none() {
+            return;
+        }
+
         let mut pushed = false;
         self.window().set_offscreen_data(None);
 
-        if let Some(open) = &self.open_animation {
+        if let Some(minimize) = &self.minimize_animation {
+            // The window shrinks into the dock and fades on the way, and grows back out of it.
+            let mut ctx = ctx.as_gles();
+            let mut elements = Vec::new();
+            self.render_contents(
+                ctx.r(),
+                Point::new(0., 0.),
+                xray_pos,
+                focus_ring,
+                &mut |elem| elements.push(elem),
+            );
+            match minimize.offscreen.render(ctx.renderer, scale, &elements) {
+                Ok((elem, _sync, data)) => {
+                    let progress = minimize.anim.value();
+                    let clamped = minimize.anim.clamped_value().clamp(0., 1.);
+                    // The fade comes late, so the window is seen going all the way down.
+                    let alpha = 1. - clamped.powi(3);
+                    let elem = elem.with_alpha(tile_alpha * alpha as f32);
+
+                    let size = self.animated_tile_size();
+                    let center = size.to_point().downscale(2.);
+                    let elem = RescaleRenderElement::from_element(
+                        elem,
+                        center.to_physical_precise_round(scale),
+                        (1. - 0.88 * progress).max(0.02),
+                    );
+                    let shift = minimize.target.upscale(progress);
+                    let elem = RelocateRenderElement::from_element(
+                        elem,
+                        (location + shift).to_physical_precise_round(scale),
+                        Relocate::Relative,
+                    );
+
+                    self.window().set_offscreen_data(Some(data));
+                    push(OpeningWindowRenderElement::from(elem).into());
+                    pushed = true;
+                }
+                Err(err) => {
+                    warn!("error rendering tile to offscreen for minimize animation: {err:?}");
+                }
+            }
+        } else if let Some(open) = &self.open_animation {
             let mut ctx = ctx.as_gles();
             let mut elements = Vec::new();
             self.render_contents(

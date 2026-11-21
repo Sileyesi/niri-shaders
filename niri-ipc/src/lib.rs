@@ -1063,6 +1063,15 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         id: Option<u64>,
     },
+    /// Minimize the focused floating window: it goes out of sight and out of the focus until it is
+    /// focused again, for example from a dock.
+    MinimizeWindow {
+        /// Id of the window to minimize.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
     /// Move all windows to the floating layout, or back to tiling if none of them are tiled.
     ///
     /// Back in tiling, the windows of each workspace go in columns left to right, as they are on
@@ -1618,6 +1627,9 @@ pub struct Window {
     ///
     /// If the window isn't floating then it is in the tiling layout.
     pub is_floating: bool,
+    /// Whether this floating window is minimized.
+    #[serde(default)]
+    pub is_minimized: bool,
     /// Whether this window requests your attention.
     pub is_urgent: bool,
     /// Position- and size-related properties of the window.
