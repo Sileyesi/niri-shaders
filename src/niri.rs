@@ -159,7 +159,6 @@ use crate::layout::workspace::{Workspace, WorkspaceId};
 use crate::layout::{
     HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
 };
-use crate::niri_render_elements;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
 use crate::protocols::gamma_control::GammaControlManagerState;
@@ -176,7 +175,7 @@ use crate::render_helpers::texture::TextureBuffer;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{
     encompassing_geo, render_to_encompassing_texture, render_to_shm, render_to_texture,
-    render_to_vec, shaders, CaptureBuffer, RenderCtx, RenderTarget,
+    render_to_vec, shader_pipeline, shaders, CaptureBuffer, RenderCtx, RenderTarget,
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
@@ -198,6 +197,7 @@ use crate::utils::{
 };
 use crate::window::mapped::{MappedId, WindowCastRenderElements};
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
+use crate::{niri_render_elements, window_shader};
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 
@@ -213,6 +213,9 @@ pub struct SavedKeyboardState {
     pub caps_lock: Option<bool>,
     pub num_lock: Option<bool>,
 }
+
+/// How often to check whether the shader files set at runtime changed.
+const WINDOW_SHADER_RELOAD_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
@@ -1060,6 +1063,7 @@ impl State {
         }
 
         self.niri.pointer_contents.clone_from(&under);
+        self.niri.update_window_shader_pointer(location);
 
         let pointer = &self.niri.seat.get_pointer().unwrap();
         pointer.motion(
@@ -1292,6 +1296,7 @@ impl State {
         }
 
         self.niri.pointer_contents.clone_from(&under);
+        self.niri.update_window_shader_pointer(location);
 
         pointer.motion(
             self,
@@ -2813,6 +2818,18 @@ impl Niri {
             )
             .unwrap();
 
+        // Shader files from the config are watched along with it, these are the ones set at
+        // runtime.
+        event_loop
+            .insert_source(
+                Timer::from_duration(WINDOW_SHADER_RELOAD_INTERVAL),
+                |_, _, state| {
+                    window_shader::reload_override_files(state);
+                    TimeoutAction::ToDuration(WINDOW_SHADER_RELOAD_INTERVAL)
+                },
+            )
+            .unwrap();
+
         let socket_name = create_wayland_socket.then(|| {
             let socket_source = ListeningSocketSource::new_auto().unwrap();
             let socket_name = socket_source.socket_name().to_os_string();
@@ -4076,6 +4093,47 @@ impl Niri {
         state.lock_surface.as_ref().map(|s| s.wl_surface()).cloned()
     }
 
+    /// Tells the window under the pointer where the pointer is, for window shaders.
+    pub fn update_window_shader_pointer(&mut self, location: Point<f64, Logical>) {
+        let hovered = match &self.pointer_contents.window {
+            Some((window, HitType::Input { win_pos })) => Some((window.clone(), *win_pos)),
+            _ => None,
+        };
+
+        // The part of a title bar under the pointer, for the hover highlight.
+        let titlebar = self
+            .output_under(location)
+            .and_then(|(output, pos)| self.layout.titlebar_under(output, pos))
+            .map(|(mapped, part)| (mapped.window.clone(), part));
+
+        let mut redraw = false;
+        for (_, mapped) in self.layout.windows() {
+            let part = match &titlebar {
+                Some((window, part)) if *window == mapped.window => Some(*part),
+                _ => None,
+            };
+            redraw |= mapped.set_titlebar_hover(part);
+
+            let pos = match &hovered {
+                Some((window, win_pos)) if *window == mapped.window => {
+                    // win_pos is where the buffer is, which is offset from the geometry.
+                    Some(location - *win_pos + mapped.buf_loc().to_f64())
+                }
+                _ => None,
+            };
+
+            if mapped.pointer_position() != pos {
+                mapped.set_pointer_position(pos);
+                redraw |= mapped.follows_pointer();
+            }
+        }
+
+        if redraw {
+            // FIXME: granular
+            self.queue_redraw_all();
+        }
+    }
+
     /// Schedules an immediate redraw on all outputs if one is not already scheduled.
     pub fn queue_redraw_all(&mut self) {
         for state in self.output_state.values_mut() {
@@ -4553,6 +4611,38 @@ impl Niri {
                 }
 
                 let layer_map = layer_map_for_output(out);
+
+                // What layer shader pipelines know about the output: its windows and the pointer.
+                let mut pipeline_inputs = None;
+                if layer_map.layers().any(|surface| {
+                    self.mapped_layer_surfaces
+                        .get(surface)
+                        .is_some_and(|mapped| mapped.rules().shader_pipeline.is_some())
+                }) {
+                    let mut inputs = shader_pipeline::Inputs::default();
+                    if let Some(output_geo) = self.global_space.output_geometry(out) {
+                        inputs.output_size = output_geo.size.to_f64();
+                        let pointer = self.seat.get_pointer().unwrap().current_location();
+                        let pointer = pointer - output_geo.loc.to_f64();
+                        if Rectangle::from_size(inputs.output_size).contains(pointer) {
+                            inputs.pointer = Some(pointer);
+                        }
+                    }
+                    if let Some(mon) = self.layout.monitor_for_output(out) {
+                        for (ws, ws_geo) in mon.workspaces_with_render_geo() {
+                            for (tile, pos, visible) in ws.tiles_with_render_positions() {
+                                if !visible {
+                                    continue;
+                                }
+                                let rect =
+                                    Rectangle::new(ws_geo.loc + pos, tile.animated_tile_size());
+                                inputs.windows.push((tile.window().id().get(), rect));
+                            }
+                        }
+                    }
+                    pipeline_inputs = Some(inputs);
+                }
+
                 for surface in layer_map.layers() {
                     let Some(mapped) = self.mapped_layer_surfaces.get_mut(surface) else {
                         continue;
@@ -4562,6 +4652,9 @@ impl Niri {
                     };
 
                     mapped.update_render_elements(geo.size.to_f64());
+                    if let Some(inputs) = &pipeline_inputs {
+                        mapped.update_pipeline(inputs);
+                    }
                 }
             }
         }

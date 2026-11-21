@@ -23,6 +23,8 @@ use wayland_backend::server::Credentials;
 
 use super::{ResolvedWindowRules, WindowRef};
 use crate::handlers::KdeDecorationsModeState;
+use crate::input::DOUBLE_CLICK_TIME;
+use crate::layout::titlebar::TitleBarPart;
 use crate::layout::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, LayoutElementRenderElement,
     LayoutElementRenderSnapshot, SizingMode,
@@ -46,6 +48,7 @@ use crate::utils::{
     with_toplevel_last_uncommitted_configure, with_toplevel_role, with_toplevel_role_and_current,
     ResizeEdge,
 };
+use crate::window_shader::{ResolvedShader, ShaderOverride};
 
 #[derive(Debug)]
 pub struct Mapped {
@@ -193,6 +196,24 @@ pub struct Mapped {
 
     /// Most recent monotonic time when the window had the focus.
     focus_timestamp: Option<Duration>,
+
+    /// Shader set at runtime, which takes precedence over the window rules.
+    shader_override: Option<ShaderOverride>,
+
+    /// The shader to draw the window with, from the override or the rules.
+    window_shader: Option<ResolvedShader>,
+
+    /// Pointer position relative to the window geometry, when the pointer is over the window.
+    pointer_position: Cell<Option<Point<f64, Logical>>>,
+
+    /// A stone to drop into the shader pipeline, relative to the window geometry.
+    pipeline_drop: Cell<Option<Point<f64, Logical>>>,
+
+    /// Part of the title bar under the pointer.
+    titlebar_hover: Cell<Option<TitleBarPart>>,
+
+    /// When the title bar was last clicked, for double clicks.
+    last_titlebar_click: Cell<Option<Duration>>,
 }
 
 niri_render_elements! {
@@ -312,8 +333,15 @@ impl Mapped {
             is_pending_maximized: false,
             uncommitted_maximized: Vec::new(),
             focus_timestamp: None,
+            shader_override: None,
+            window_shader: None,
+            pointer_position: Cell::new(None),
+            pipeline_drop: Cell::new(None),
+            titlebar_hover: Cell::new(None),
+            last_titlebar_click: Cell::new(None),
         };
 
+        rv.update_window_shader();
         rv.is_maximized = rv.sizing_mode().is_maximized();
         rv.is_pending_maximized = rv.pending_sizing_mode().is_maximized();
 
@@ -340,7 +368,92 @@ impl Mapped {
         }
 
         self.rules = new_rules;
+        self.update_window_shader();
         true
+    }
+
+    fn update_window_shader(&mut self) {
+        let shader = match &self.shader_override {
+            Some(ShaderOverride::Cleared) => None,
+            Some(ShaderOverride::Set { shader, .. }) => Some(shader),
+            None => self.rules.shader.as_ref(),
+        };
+        let shader = shader.map(ResolvedShader::new);
+
+        if shader != self.window_shader {
+            if let Some(ResolvedShader {
+                name,
+                code: Err(err),
+                ..
+            }) = &shader
+            {
+                warn!("window shader {name}: {err}");
+            }
+        }
+
+        self.window_shader = shader;
+    }
+
+    /// Sets a shader at runtime, `None` goes back to the window rules.
+    pub fn set_shader_override(&mut self, shader: Option<ShaderOverride>) {
+        self.shader_override = shader;
+        self.update_window_shader();
+    }
+
+    pub fn shader_override(&self) -> Option<&ShaderOverride> {
+        self.shader_override.as_ref()
+    }
+
+    /// Reads the shader file set at runtime again if it changed, and returns whether it did.
+    pub fn reload_shader_override(&mut self) -> bool {
+        let changed = self
+            .shader_override
+            .as_mut()
+            .is_some_and(ShaderOverride::reload_if_changed);
+        if changed {
+            self.update_window_shader();
+        }
+        changed
+    }
+
+    /// Sets the pointer position relative to the window geometry, for the window shader.
+    pub fn set_pointer_position(&self, pos: Option<Point<f64, Logical>>) {
+        self.pointer_position.set(pos);
+    }
+
+    /// Drops a stone into the window's shader pipeline at a point relative to the window geometry.
+    ///
+    /// Returns whether the window has a pipeline.
+    pub fn drop_into_pipeline(&self, pos: Point<f64, Logical>) -> bool {
+        if self.rules.shader_pipeline.is_none() {
+            return false;
+        }
+        self.pipeline_drop.set(Some(pos));
+        true
+    }
+
+    /// Sets the part of the title bar under the pointer, and returns whether it changed.
+    pub fn set_titlebar_hover(&self, part: Option<TitleBarPart>) -> bool {
+        self.titlebar_hover.replace(part) != part
+    }
+
+    /// Records a click on the title bar, and returns whether it makes a double click.
+    pub fn titlebar_clicked(&self, time: Duration) -> bool {
+        match self.last_titlebar_click.get() {
+            Some(last) if time.saturating_sub(last) <= DOUBLE_CLICK_TIME => {
+                self.last_titlebar_click.set(None);
+                true
+            }
+            _ => {
+                self.last_titlebar_click.set(Some(time));
+                false
+            }
+        }
+    }
+
+    /// Whether the window is drawn with something that follows the pointer.
+    pub fn follows_pointer(&self) -> bool {
+        self.window_shader.is_some() || self.rules.shader_pipeline.is_some()
     }
 
     pub fn recompute_window_rules_if_needed(
@@ -385,6 +498,19 @@ impl Mapped {
 
     pub fn is_window_cast_target(&self) -> bool {
         self.is_window_cast_target
+    }
+
+    /// Background effect from the rules, with blur when the shader is made for it.
+    fn background_effect(&self) -> niri_config::BackgroundEffect {
+        let mut effect = self.rules.background_effect;
+        if effect.blur.is_none() && self.window_shader.as_ref().is_some_and(|s| s.wants_blur) {
+            effect.blur = Some(true);
+        }
+        // Floating windows can be over other windows, which xray doesn't show.
+        if self.is_floating && effect.xray.is_none() {
+            effect.xray = Some(false);
+        }
+        effect
     }
 
     pub fn toggle_ignore_opacity_window_rule(&mut self) {
@@ -441,6 +567,7 @@ impl Mapped {
             texture: Default::default(),
             texture_with_blocked_out_bg: Default::default(),
             blocked_out_texture: Default::default(),
+            close_shader: None,
         }
     }
 
@@ -768,7 +895,7 @@ impl LayoutElement for Mapped {
             surface_anim_scale,
             self.blur_config,
             radius,
-            self.rules.background_effect,
+            self.background_effect(),
             should_block_out,
             xray_pos,
             push,
@@ -1360,6 +1487,26 @@ impl LayoutElement for Mapped {
 
     fn refresh(&self) {
         self.window.refresh();
+    }
+
+    fn window_shader(&self) -> Option<&ResolvedShader> {
+        self.window_shader.as_ref()
+    }
+
+    fn pointer_position(&self) -> Option<Point<f64, Logical>> {
+        self.pointer_position.get()
+    }
+
+    fn take_pipeline_drop(&self) -> Option<Point<f64, Logical>> {
+        self.pipeline_drop.take()
+    }
+
+    fn title(&self) -> Option<String> {
+        with_toplevel_role(self.toplevel(), |role| role.title.clone())
+    }
+
+    fn titlebar_hover(&self) -> Option<TitleBarPart> {
+        self.titlebar_hover.get()
     }
 
     fn rules(&self) -> &ResolvedWindowRules {

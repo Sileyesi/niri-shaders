@@ -13,6 +13,7 @@ use smithay::desktop::layer_map_for_output;
 use smithay::output::{Mode, PhysicalProperties, Subpixel};
 use smithay::utils::Rectangle;
 
+use super::titlebar::{TitleBarPart, TITLEBAR_HEIGHT};
 use super::*;
 
 mod animations;
@@ -125,6 +126,7 @@ impl TestWindow {
                         texture: OnceCell::new(),
                         texture_with_blocked_out_bg: Default::default(),
                         blocked_out_texture: OnceCell::new(),
+                        close_shader: None,
                     }));
                 }
 
@@ -646,6 +648,7 @@ enum Op {
         id: Option<usize>,
         floating: bool,
     },
+    ToggleAllWindowsFloating,
     FocusFloating,
     FocusTiling,
     SwitchFocusFloatingTiling,
@@ -1417,6 +1420,7 @@ impl Op {
                 let id = id.filter(|id| layout.has_window(id));
                 layout.set_window_floating(id.as_ref(), floating);
             }
+            Op::ToggleAllWindowsFloating => layout.toggle_all_windows_floating(),
             Op::FocusFloating => {
                 layout.focus_floating();
             }
@@ -3214,6 +3218,78 @@ fn interactive_move_from_workspace_with_layout_config() {
 }
 
 #[test]
+fn toggle_all_windows_floating_tiles_in_screen_order() {
+    let move_to = |id, x| Op::MoveFloatingWindow {
+        id: Some(id),
+        x: PositionChange::SetFixed(x),
+        y: PositionChange::SetFixed(0.),
+        animate: false,
+    };
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::FocusColumnLeft,
+        Op::ToggleAllWindowsFloating,
+        Op::Communicate(1),
+        Op::Communicate(2),
+        Op::Communicate(3),
+        move_to(1, 1000.),
+        move_to(2, 0.),
+        move_to(3, 500.),
+        Op::CompleteAnimations,
+        Op::ToggleAllWindowsFloating,
+    ];
+    let layout = check_ops(ops);
+
+    let ws = layout.active_workspace().unwrap();
+    assert!(ws.floating().is_empty());
+    let order: Vec<_> = ws
+        .scrolling()
+        .tiles()
+        .map(|tile| *tile.window().id())
+        .collect();
+    assert_eq!(order, [2, 3, 1]);
+    assert_eq!(ws.active_window().map(|win| *win.id()), Some(2));
+}
+
+#[test]
+fn toggle_all_windows_floating_floats_everything() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::FocusWorkspaceDown,
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::ToggleWindowFloating { id: Some(3) },
+        Op::AddWindow {
+            params: TestWindowParams::new(4),
+        },
+        Op::ToggleAllWindowsFloating,
+    ];
+    let layout = check_ops(ops);
+
+    assert!(layout
+        .workspaces()
+        .all(|(_, _, ws)| !ws.has_tiled_windows()));
+    let ws = layout.active_workspace().unwrap();
+    assert_eq!(ws.active_window().map(|win| *win.id()), Some(4));
+}
+
+#[test]
 fn set_width_fixed_negative() {
     let ops = [
         Op::AddOutput(3),
@@ -4629,4 +4705,82 @@ proptest! {
 
         check_ops_with_options(options, ops);
     }
+}
+
+#[test]
+fn floating_titlebar_sizes_and_fill() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::ToggleWindowFloating { id: Some(1) },
+        Op::Communicate(1),
+        Op::CompleteAnimations,
+    ];
+    let options = Options {
+        layout: niri_config::Layout {
+            floating_titlebars: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut layout = check_ops_with_options(options, ops);
+
+    let tile_of = |layout: &Layout<TestWindow>| {
+        let ws = layout.active_workspace().unwrap();
+        let (tile, pos, _) = ws.tiles_with_render_positions().next().unwrap();
+        (tile.tile_size(), tile.window_size(), tile.window_loc(), pos)
+    };
+
+    // The title bar goes above the window.
+    let (tile_size, window_size, window_loc, pos) = tile_of(&layout);
+    assert_eq!(tile_size.h, window_size.h + TITLEBAR_HEIGHT);
+    assert_eq!(window_loc.y, TITLEBAR_HEIGHT);
+
+    // The buttons are at the left of the title bar.
+    let ws = layout.active_workspace().unwrap();
+    let close = pos + Point::from((20., 16.));
+    let maximize = pos + Point::from((60., 16.));
+    let title = pos + Point::from((tile_size.w / 2., 16.));
+    let below = pos + Point::from((10., TITLEBAR_HEIGHT + 10.));
+    assert_eq!(
+        ws.titlebar_under(close).map(|(_, part)| part),
+        Some(TitleBarPart::Close)
+    );
+    assert_eq!(
+        ws.titlebar_under(maximize).map(|(_, part)| part),
+        Some(TitleBarPart::Maximize)
+    );
+    assert_eq!(
+        ws.titlebar_under(title).map(|(_, part)| part),
+        Some(TitleBarPart::Title)
+    );
+    assert_eq!(ws.titlebar_under(below).map(|(_, part)| part), None);
+
+    // Maximizing fills the working area, and a second time goes back.
+    layout.toggle_window_fill(&1);
+    check_ops_on_layout(&mut layout, [Op::Communicate(1), Op::CompleteAnimations]);
+    let area = layout.active_workspace().unwrap().working_area();
+    let (filled, _, _, filled_pos) = tile_of(&layout);
+    assert_eq!(filled, area.size);
+    assert_eq!(filled_pos, area.loc);
+
+    layout.toggle_window_fill(&1);
+    check_ops_on_layout(&mut layout, [Op::Communicate(1), Op::CompleteAnimations]);
+    let (restored, _, _, restored_pos) = tile_of(&layout);
+    assert_eq!(restored, tile_size);
+    assert_eq!(restored_pos, pos);
+
+    // Tiled windows have no title bar.
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::ToggleWindowFloating { id: Some(1) },
+            Op::Communicate(1),
+            Op::CompleteAnimations,
+        ],
+    );
+    let (tile_size, window_size, _, _) = tile_of(&layout);
+    assert_eq!(tile_size.h, window_size.h);
 }

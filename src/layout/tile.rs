@@ -1,5 +1,9 @@
 use core::f64;
+use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash as _, Hasher as _};
 use std::rc::Rc;
+use std::time::Duration;
 
 use niri_config::utils::MergeWith as _;
 use niri_config::{Color, CornerRadius, GradientInterpolation};
@@ -11,23 +15,32 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
 use super::opening_window::{OpenAnimation, OpeningWindowRenderElement};
 use super::shadow::Shadow;
+use super::titlebar::{TitleBar, TitleBarPart, TitleBarState, TITLEBAR_HEIGHT};
 use super::{
     HitType, LayoutElement, LayoutElementRenderElement, LayoutElementRenderSnapshot, Options,
     SizeFrac, RESIZE_ANIMATION_THRESHOLD,
 };
-use crate::animation::{Animation, Clock};
+use crate::animation::{Animation, Clock, Curve};
 use crate::layout::SizingMode;
 use crate::niri_render_elements;
+use crate::render_helpers::backdrop_glass::{round_area, BackdropGlass, GlassStyle};
 use crate::render_helpers::background_effect::BackgroundEffectElement;
+use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
+use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::resize::ResizeRenderElement;
+use crate::render_helpers::shader_element::ShaderRenderElement;
+use crate::render_helpers::shader_pipeline::{self, SurfacePipeline};
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+use crate::render_helpers::window_shader::{
+    self, Backdrop, CloseShader, CompiledShader, WindowShaderBuffer,
+};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::transaction::Transaction;
@@ -75,6 +88,22 @@ pub struct Tile<W: LayoutElement> {
     /// the window starts out in the tiling layout.
     pub(super) floating_pos: Option<Point<f64, SizeFrac>>,
 
+    /// Whether the tile is in the floating layout, or moved interactively from there. Floating
+    /// tiles have a title bar if the layout says so.
+    pub(super) is_floating: bool,
+
+    /// Position and window size to go back to from maximizing with the title bar button.
+    pub(super) floating_restore: Option<(Point<f64, Logical>, Size<i32, Logical>)>,
+
+    /// Title bar of the floating tile.
+    titlebar: TitleBar,
+
+    /// Liquid glass under the title bar.
+    titlebar_glass: BackdropGlass,
+
+    /// Whether the title bar is drawn as active.
+    titlebar_active: bool,
+
     /// Currently selected preset width index when this tile is floating.
     pub(super) floating_preset_width_idx: Option<usize>,
 
@@ -118,6 +147,53 @@ pub struct Tile<W: LayoutElement> {
 
     /// Configurable properties of the layout.
     pub(super) options: Rc<Options>,
+
+    /// State for drawing the tile through the window shader, if the window has one.
+    shader: Option<TileShader>,
+
+    /// State of the shader pipeline, if the window has one.
+    pipeline: Option<SurfacePipeline>,
+}
+
+/// How long `niri_focused` takes to follow the focus.
+const SHADER_FOCUS_MS: u64 = 250;
+
+/// How long `niri_focus_time` counts after the window gets the focus. The shaders that use it are
+/// redrawn every frame for that long.
+const SHADER_FOCUS_TIME_LIMIT: Duration = Duration::from_secs(2);
+
+/// For how long after being drawn an animated shader keeps asking for redraws.
+///
+/// The redraws stop once the tile isn't drawn anymore, for example on a workspace out of view.
+const SHADER_REDRAW_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Debug)]
+struct TileShader {
+    buffer: WindowShaderBuffer,
+    /// Value for `niri_focused`.
+    focus: Animation,
+    /// Value for `niri_random_seed`.
+    random_seed: f32,
+    /// Whether the shader drawn last uses `niri_time`.
+    animated: Cell<bool>,
+    /// Whether the shader drawn last uses `niri_focus_time`.
+    uses_focus_time: Cell<bool>,
+    /// When the window got the focus last.
+    focused_at: Option<Duration>,
+    /// When the shader was drawn last.
+    drawn_at: Cell<Option<Duration>>,
+    /// Draw the tile without the shader, for a snapshot that the close animation draws with it.
+    suppressed: Cell<bool>,
+    /// Hash of the shader and uniforms that were last checked for problems with the uniforms.
+    checked: Cell<u64>,
+}
+
+/// Whether the element is a background effect that blurs what's drawn under it, rather than xray.
+fn is_nonxray_effect<R: NiriRenderer>(elem: &TileRenderElement<R>) -> bool {
+    matches!(
+        elem,
+        TileRenderElement::BackgroundEffect(BackgroundEffectElement::FramebufferEffect(_))
+    )
 }
 
 niri_render_elements! {
@@ -133,6 +209,8 @@ niri_render_elements! {
         Offscreen = OffscreenRenderElement,
         ExtraDamage = ExtraDamage,
         BackgroundEffect = BackgroundEffectElement,
+        Shader = ShaderRenderElement,
+        TitleBar = PrimaryGpuTextureRenderElement,
     }
 }
 
@@ -203,6 +281,11 @@ impl<W: LayoutElement> Tile<W> {
             restore_to_floating: false,
             floating_window_size: None,
             floating_pos: None,
+            is_floating: false,
+            floating_restore: None,
+            titlebar: TitleBar::default(),
+            titlebar_glass: BackdropGlass::default(),
+            titlebar_active: false,
             floating_preset_width_idx: None,
             floating_preset_height_idx: None,
             open_animation: None,
@@ -217,6 +300,8 @@ impl<W: LayoutElement> Tile<W> {
             scale,
             clock,
             options,
+            shader: None,
+            pipeline: None,
         }
     }
 
@@ -450,7 +535,30 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        self.are_transitions_ongoing() || self.window.rules().baba_is_float == Some(true)
+        self.are_transitions_ongoing()
+            || self.window.rules().baba_is_float == Some(true)
+            || self.are_shader_animations_ongoing()
+            || self
+                .pipeline
+                .as_ref()
+                .is_some_and(SurfacePipeline::needs_redraws)
+    }
+
+    /// Whether the window shader needs redraws, because it changes over time or follows the focus.
+    fn are_shader_animations_ongoing(&self) -> bool {
+        let Some(shader) = &self.shader else {
+            return false;
+        };
+
+        let recently_drawn = shader
+            .drawn_at
+            .get()
+            .is_some_and(|at| self.clock.now().saturating_sub(at) < SHADER_REDRAW_TIMEOUT);
+        let focus_time_running = shader.uses_focus_time.get()
+            && shader
+                .focused_at
+                .is_some_and(|at| self.clock.now().saturating_sub(at) < SHADER_FOCUS_TIME_LIMIT);
+        recently_drawn && (shader.animated.get() || !shader.focus.is_done() || focus_time_running)
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
@@ -555,6 +663,70 @@ impl<W: LayoutElement> Tile<W> {
         );
 
         self.fullscreen_backdrop.resize(animated_tile_size);
+
+        self.titlebar_active = is_active;
+        self.update_shader(is_active);
+        self.update_pipeline();
+    }
+
+    fn update_pipeline(&mut self) {
+        if self.window.rules().shader_pipeline.is_none() {
+            self.pipeline = None;
+            return;
+        }
+
+        // For a window, the "output" of the pipeline is the tile.
+        let size = self.animated_tile_size();
+        let window_loc = self.window_loc();
+        let inputs = shader_pipeline::Inputs {
+            windows: Vec::new(),
+            pointer: self.window.pointer_position().map(|pos| pos + window_loc),
+            output_size: size,
+        };
+        let drop = self.window.take_pipeline_drop();
+
+        let pipeline = self.pipeline.get_or_insert_with(SurfacePipeline::default);
+        pipeline.update(self.clock.now(), &inputs);
+        if let Some(pos) = drop {
+            pipeline.drop_at(pos + window_loc, size);
+        }
+    }
+
+    fn update_shader(&mut self, is_active: bool) {
+        if self.window.window_shader().is_none() {
+            self.shader = None;
+            return;
+        }
+
+        let target = if is_active { 1. } else { 0. };
+        let clock = &self.clock;
+        let shader = self.shader.get_or_insert_with(|| TileShader {
+            buffer: WindowShaderBuffer::default(),
+            focus: Animation::ease(clock.clone(), target, target, 0., 0, Curve::Linear),
+            random_seed: fastrand::f32(),
+            animated: Cell::new(false),
+            uses_focus_time: Cell::new(false),
+            focused_at: None,
+            drawn_at: Cell::new(None),
+            suppressed: Cell::new(false),
+            checked: Cell::new(0),
+        });
+
+        if shader.focus.to() != target {
+            if is_active {
+                shader.focused_at = Some(clock.now());
+            }
+
+            let from = shader.focus.value();
+            shader.focus = Animation::ease(
+                clock.clone(),
+                from,
+                target,
+                0.,
+                SHADER_FOCUS_MS,
+                Curve::EaseOutCubic,
+            );
+        }
     }
 
     pub fn scale(&self) -> f64 {
@@ -778,12 +950,64 @@ impl<W: LayoutElement> Tile<W> {
         Some(self.border.width())
     }
 
+    /// Height of the title bar, or 0 if the tile has none.
+    pub fn titlebar_height(&self) -> f64 {
+        if self.is_floating
+            && self.options.layout.floating_titlebars
+            && !self.sizing_mode.is_fullscreen()
+        {
+            TITLEBAR_HEIGHT
+        } else {
+            0.
+        }
+    }
+
+    /// Area of the title bar within the tile, if it has one.
+    fn titlebar_rect(&self) -> Option<Rectangle<f64, Logical>> {
+        let height = self.titlebar_height();
+        if height == 0. {
+            return None;
+        }
+        let border = self.effective_border_width().unwrap_or(0.);
+        let width = self.animated_tile_size().w - border * 2.;
+        Some(Rectangle::new(
+            Point::from((border, border)),
+            Size::from((width, height)),
+        ))
+    }
+
+    /// Part of the title bar at a point within the tile.
+    pub fn titlebar_part(&self, point: Point<f64, Logical>) -> Option<TitleBarPart> {
+        let rect = self.titlebar_rect()?;
+        TitleBarPart::at(point - self.bob_offset() - rect.loc, rect.size.w)
+    }
+
+    /// Whether the window fills the working area from the title bar button.
+    pub fn is_titlebar_maximized(&self) -> bool {
+        self.floating_restore.is_some()
+    }
+
+    /// Corner radius of the window, without the top corners when the title bar is over them.
+    fn window_corner_radius(&self) -> CornerRadius {
+        let mut radius = self.window.geometry_corner_radius();
+        if self.titlebar_height() > 0. {
+            radius.top_left = 0.;
+            radius.top_right = 0.;
+        }
+        radius
+    }
+
     /// Returns the location of the window's visual geometry within this Tile.
     pub fn window_loc(&self) -> Point<f64, Logical> {
         let mut loc = Point::from((0., 0.));
 
         let window_size = self.animated_window_size();
-        let target_size = self.animated_tile_size();
+        let mut target_size = self.animated_tile_size();
+
+        // The title bar goes above the window.
+        let titlebar = self.titlebar_height();
+        loc.y += titlebar;
+        target_size.h -= titlebar;
 
         // Center the window within its tile.
         //
@@ -819,6 +1043,7 @@ impl<W: LayoutElement> Tile<W> {
             size.w += width * 2.;
             size.h += width * 2.;
         }
+        size.h += self.titlebar_height();
 
         size
     }
@@ -838,6 +1063,7 @@ impl<W: LayoutElement> Tile<W> {
             size.w += width * 2.;
             size.h += width * 2.;
         }
+        size.h += self.titlebar_height();
 
         size
     }
@@ -951,6 +1177,7 @@ impl<W: LayoutElement> Tile<W> {
             size.w = f64::max(1., size.w - width * 2.);
             size.h = f64::max(1., size.h - width * 2.);
         }
+        size.h = f64::max(1., size.h - self.titlebar_height());
 
         // The size request has to be i32 unfortunately, due to Wayland. We floor here instead of
         // round to avoid situations where proportionally-sized columns don't fit on the screen
@@ -972,6 +1199,7 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn tile_height_for_window_height(&self, size: f64) -> f64 {
+        let size = size + self.titlebar_height();
         if self.border.is_off() {
             size
         } else {
@@ -988,6 +1216,7 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn window_height_for_tile_height(&self, size: f64) -> f64 {
+        let size = size - self.titlebar_height();
         if self.border.is_off() {
             size
         } else {
@@ -1033,6 +1262,7 @@ impl<W: LayoutElement> Tile<W> {
             size.w += width * 2.;
             size.h += width * 2.;
         }
+        size.h += self.titlebar_height();
 
         size
     }
@@ -1050,6 +1280,9 @@ impl<W: LayoutElement> Tile<W> {
             if size.h > 0. {
                 size.h += width * 2.;
             }
+        }
+        if size.h > 0. {
+            size.h += self.titlebar_height();
         }
 
         size
@@ -1114,8 +1347,7 @@ impl<W: LayoutElement> Tile<W> {
         // that submit a full-sized buffer before acking the fullscreen state (Firefox).
         let clip_to_geometry = fullscreen_progress < 1. && rules.clip_to_geometry == Some(true);
         let radius = self
-            .window
-            .geometry_corner_radius()
+            .window_corner_radius()
             .scaled_by(1. - expanded_progress as f32);
 
         // Popups go on top, whether it's resize or not.
@@ -1282,6 +1514,31 @@ impl<W: LayoutElement> Tile<W> {
                 });
         }
 
+        if let Some(rect) = self.titlebar_rect() {
+            // Blocked-out windows don't show their title.
+            let title = if ctx.target.should_block_out(rules.block_out_from) {
+                String::new()
+            } else {
+                self.window.title().unwrap_or_default()
+            };
+            let state = TitleBarState {
+                title,
+                active: self.titlebar_active,
+                maximized: self.is_titlebar_maximized(),
+                hovered: self.window.titlebar_hover(),
+                radius: self.window.geometry_corner_radius(),
+            };
+            let loc = (location + rect.loc)
+                .to_physical_precise_round(scale)
+                .to_logical(scale);
+            if let Some(elem) =
+                self.titlebar
+                    .render(ctx.renderer, &state, rect.size.w, self.scale, loc, 1.)
+            {
+                push(elem.into());
+            }
+        }
+
         if fullscreen_progress > 0. {
             let alpha = fullscreen_progress as f32;
 
@@ -1358,6 +1615,311 @@ impl<W: LayoutElement> Tile<W> {
         );
     }
 
+    /// Renders the tile through the window shader, or as is if it has none.
+    fn render_contents<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        location: Point<f64, Logical>,
+        xray_pos: XrayPos,
+        focus_ring: bool,
+        push: &mut dyn FnMut(TileRenderElement<R>),
+    ) {
+        // A shader set on the window, from the rules or at runtime, goes over its pipeline.
+        if self.render_shader(ctx.r(), location, xray_pos, focus_ring, push) {
+            return;
+        }
+        if !self.render_pipeline(ctx.r(), location, xray_pos, focus_ring, push) {
+            self.render_inner(ctx, location, xray_pos, focus_ring, push);
+        }
+    }
+
+    /// Renders the tile with its shader pipeline, and returns whether it did.
+    ///
+    /// Returns `false` when the window has no pipeline, it has nothing to show right now, or it
+    /// fails, in which case the tile should be rendered as usual.
+    fn render_pipeline<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        location: Point<f64, Logical>,
+        xray_pos: XrayPos,
+        focus_ring: bool,
+        push: &mut dyn FnMut(TileRenderElement<R>),
+    ) -> bool {
+        let (Some(pipeline), Some(config)) = (&self.pipeline, &self.window.rules().shader_pipeline)
+        else {
+            return false;
+        };
+        let uses_backdrop = config.uses_backdrop();
+
+        let nonxray;
+        let elem = {
+            let mut ctx = ctx.as_gles();
+
+            // The textures have the tile at (0, 0), with the backdrop apart.
+            let mut elements = Vec::new();
+            self.render_inner(
+                ctx.r(),
+                Point::new(0., 0.),
+                xray_pos,
+                focus_ring,
+                &mut |elem| elements.push(elem),
+            );
+            let (backdrop, contents): (Vec<_>, Vec<_>) = elements
+                .into_iter()
+                .partition(|elem| matches!(elem, TileRenderElement::BackgroundEffect(_)));
+
+            // A floating window blurs what's drawn under it, which the offscreen textures don't
+            // have. Its background effect goes right under the pipeline instead, which takes the
+            // backdrop from the framebuffer.
+            nonxray = backdrop.iter().any(is_nonxray_effect);
+            let backdrop = match (uses_backdrop, nonxray) {
+                (false, _) => Backdrop::None,
+                (true, false) => Backdrop::Elements(&backdrop[..]),
+                (true, true) => Backdrop::Framebuffer,
+            };
+
+            let res = pipeline.render(
+                ctx.renderer,
+                config,
+                &contents,
+                backdrop,
+                None,
+                self.animated_tile_size(),
+                Scale::from(self.scale),
+                location,
+                1.,
+                self.clock.now(),
+            );
+            match res {
+                Ok(Some(elem)) => elem,
+                Ok(None) => return false,
+                Err(err) => {
+                    warn!("error rendering the window shader pipeline: {err:?}");
+                    return false;
+                }
+            }
+        };
+
+        // The background effect to draw under the pipeline, when it's drawn apart.
+        let mut below = Vec::new();
+        if nonxray {
+            self.render_inner(ctx.r(), location, xray_pos, focus_ring, &mut |elem| {
+                if matches!(elem, TileRenderElement::BackgroundEffect(_)) {
+                    below.push(elem);
+                }
+            });
+        }
+
+        if config.behind {
+            // The tile goes on top, without the background effect that the pipeline draws.
+            let skip_effect = uses_backdrop || nonxray;
+            self.render_inner(ctx, location, xray_pos, focus_ring, &mut |elem| {
+                if !(skip_effect && matches!(elem, TileRenderElement::BackgroundEffect(_))) {
+                    push(elem);
+                }
+            });
+        }
+        push(elem.into());
+        for elem in below {
+            push(elem);
+        }
+        true
+    }
+
+    /// Renders the tile through the window shader, and returns whether it did.
+    ///
+    /// Returns `false` when the window has no shader, or the shader doesn't compile, in which case
+    /// the tile should be rendered as usual.
+    fn render_shader<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        location: Point<f64, Logical>,
+        xray_pos: XrayPos,
+        focus_ring: bool,
+        push: &mut dyn FnMut(TileRenderElement<R>),
+    ) -> bool {
+        let Some(state) = &self.shader else {
+            return false;
+        };
+        if state.suppressed.get() {
+            return false;
+        }
+
+        let mut gles = ctx.as_gles();
+        let Some((shader, params)) = self.shader_with_params(gles.renderer) else {
+            return false;
+        };
+
+        let mut elements = Vec::new();
+        self.render_inner(
+            gles.r(),
+            Point::new(0., 0.),
+            xray_pos,
+            focus_ring,
+            &mut |elem| elements.push(elem),
+        );
+
+        // A floating window blurs what's drawn under it, which the offscreen buffer doesn't have.
+        // Its background effect goes right under the shader instead, and a shader that gets the
+        // backdrop takes it from the framebuffer.
+        let nonxray = elements.iter().any(is_nonxray_effect);
+        let behind: Vec<_>;
+        let mut backdrop = Backdrop::None;
+        if nonxray {
+            elements.retain(|elem| !matches!(elem, TileRenderElement::BackgroundEffect(_)));
+            if shader.uses_backdrop() {
+                backdrop = Backdrop::Framebuffer;
+            }
+        } else if shader.uses_backdrop() {
+            // A shader that gets the backdrop as a texture of its own gets the window without it.
+            let contents;
+            (behind, contents) = elements
+                .into_iter()
+                .partition(|elem| matches!(elem, TileRenderElement::BackgroundEffect(_)));
+            elements = contents;
+            backdrop = Backdrop::Elements(&behind);
+        }
+
+        let scale = Scale::from(self.scale);
+        let res = state.buffer.render(
+            gles.renderer,
+            &elements,
+            backdrop,
+            &shader,
+            &params,
+            location,
+            scale,
+            1.,
+        );
+        match res {
+            Ok((elem, data)) => {
+                self.window().set_offscreen_data(Some(data));
+                push(elem.into());
+                if nonxray {
+                    self.render_inner(ctx, location, xray_pos, focus_ring, &mut |elem| {
+                        if matches!(elem, TileRenderElement::BackgroundEffect(_)) {
+                            push(elem);
+                        }
+                    });
+                }
+                state
+                    .animated
+                    .set(shader.is_animated(&params.user_uniforms, &params.clock_uniforms));
+                state.uses_focus_time.set(shader.uses_focus_time());
+                state.drawn_at.set(Some(self.clock.now()));
+                true
+            }
+            Err(err) => {
+                warn!("error rendering window shader: {err:?}");
+                false
+            }
+        }
+    }
+
+    /// Color of the border for shaders, premultiplied: the active one when `focus` is 1, the
+    /// inactive one at 0. Without a border, the focus ring colors.
+    fn shader_border_color(&self, focus: f32) -> [f32; 4] {
+        let config = if self.border.is_off() {
+            self.focus_ring.config()
+        } else {
+            self.border.config()
+        };
+        if self.window.is_urgent() {
+            return config.urgent_color.to_array_premul();
+        }
+
+        let active = config.active_color.to_array_premul();
+        let inactive = config.inactive_color.to_array_premul();
+        std::array::from_fn(|i| inactive[i] + (active[i] - inactive[i]) * focus)
+    }
+
+    /// Returns the compiled window shader and its parameters for drawing it now.
+    fn shader_with_params(
+        &self,
+        renderer: &mut GlesRenderer,
+    ) -> Option<(CompiledShader, window_shader::Params)> {
+        let state = self.shader.as_ref()?;
+        let resolved = self.window.window_shader()?;
+        // The error is logged when the shader is resolved.
+        let code = resolved.code.as_ref().ok()?;
+        let shader = window_shader::compile(renderer, &resolved.name, code, resolved.input).ok()?;
+
+        let checked = {
+            let mut hasher = DefaultHasher::new();
+            shader.key.hash(&mut hasher);
+            for (name, values) in &*resolved.uniforms {
+                name.hash(&mut hasher);
+                values.iter().for_each(|x| x.to_bits().hash(&mut hasher));
+            }
+            hasher.finish()
+        };
+        if state.checked.replace(checked) != checked {
+            for problem in shader.uniform_problems(&resolved.uniforms) {
+                warn!("window shader {}: {problem}", resolved.name);
+            }
+        }
+
+        let expanded_progress = self.expanded_progress();
+        let border_width = self.visual_border_width().unwrap_or(0.);
+        let geo_size = self.animated_tile_size();
+        let window_rect = Rectangle::new(self.window_loc(), self.animated_window_size());
+        let window_radius = self
+            .window_corner_radius()
+            .scaled_by(1. - expanded_progress as f32);
+        // The tile keeps the rounded top corners over the title bar.
+        let radius = self
+            .window
+            .geometry_corner_radius()
+            .scaled_by(1. - expanded_progress as f32)
+            .expanded_by(border_width as f32)
+            .fit_to(geo_size.w as f32, geo_size.h as f32);
+        let window_radius =
+            window_radius.fit_to(window_rect.size.w as f32, window_rect.size.h as f32);
+
+        // Only pass values that the shader uses, so that the others don't cause damage.
+        let program = &shader.program;
+        let params = window_shader::Params {
+            geo_size,
+            window_rect,
+            radius,
+            window_radius,
+            border_width,
+            clip_to_geometry: self.window.rules().clip_to_geometry == Some(true),
+            margin: resolved.margin,
+            time: if shader.is_animated(&resolved.uniforms, &resolved.clock_uniforms) {
+                window_shader::time_uniform(self.clock.now())
+            } else {
+                0.
+            },
+            focused: if program.uses_uniform("niri_focused") {
+                state.focus.value() as f32
+            } else {
+                0.
+            },
+            cursor: if shader.uses_cursor() {
+                self.window
+                    .pointer_position()
+                    .map(|pos| pos + self.window_loc())
+            } else {
+                None
+            },
+            close_progress: 0.,
+            random_seed: state.random_seed,
+            focus_time: match state.focused_at {
+                Some(at) if shader.uses_focus_time() => {
+                    let elapsed = self.clock.now().saturating_sub(at);
+                    elapsed.min(SHADER_FOCUS_TIME_LIMIT).as_secs_f32()
+                }
+                _ => -1.,
+            },
+            border_color: self.shader_border_color(state.focus.value() as f32),
+            user_uniforms: Rc::clone(&resolved.uniforms),
+            clock_uniforms: Rc::clone(&resolved.clock_uniforms),
+        };
+
+        Some((shader, params))
+    }
+
     pub fn render<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
@@ -1385,7 +1947,7 @@ impl<W: LayoutElement> Tile<W> {
         if let Some(open) = &self.open_animation {
             let mut ctx = ctx.as_gles();
             let mut elements = Vec::new();
-            self.render_inner(
+            self.render_contents(
                 ctx.r(),
                 Point::new(0., 0.),
                 xray_pos,
@@ -1412,7 +1974,7 @@ impl<W: LayoutElement> Tile<W> {
         } else if let Some(alpha) = &self.alpha_animation {
             let mut ctx = ctx.as_gles();
             let mut elements = Vec::new();
-            self.render_inner(
+            self.render_contents(
                 ctx.r(),
                 Point::new(0., 0.),
                 xray_pos,
@@ -1435,8 +1997,50 @@ impl<W: LayoutElement> Tile<W> {
         }
 
         if !pushed {
-            self.render_inner(ctx, location, xray_pos, focus_ring, &mut |elem| push(elem));
+            self.render_contents(ctx.r(), location, xray_pos, focus_ring, &mut |elem| {
+                push(elem)
+            });
+            // The glass takes what's under the title bar from the framebuffer, so it goes under
+            // everything of the tile rather than into the offscreen textures of the animations.
+            if let Some(elem) = self.render_titlebar_glass(ctx.as_gles().renderer, location) {
+                push(elem.into());
+            }
         }
+    }
+
+    fn render_titlebar_glass(
+        &self,
+        renderer: &mut GlesRenderer,
+        location: Point<f64, Logical>,
+    ) -> Option<ShaderRenderElement> {
+        let rect = self.titlebar_rect()?;
+        let scale = Scale::from(self.scale);
+        let area = round_area(
+            Rectangle::new(location + self.bob_offset() + rect.loc, rect.size),
+            scale,
+        );
+        let style = GlassStyle {
+            rim_width: 14.,
+            refraction: 12.,
+            chromatic_shift: 1.2,
+            highlight: if self.titlebar_active { 0.9 } else { 0.5 },
+            tint: if self.titlebar_active {
+                [0.10, 0.11, 0.14, 0.30]
+            } else {
+                [0.10, 0.10, 0.12, 0.45]
+            },
+        };
+        let mut blur = BlurOptions::from(self.options.blur);
+        blur.passes = blur.passes.max(2);
+        self.titlebar_glass.render(
+            renderer,
+            area,
+            self.window.geometry_corner_radius(),
+            self.animated_window_size().h,
+            style,
+            blur,
+            scale,
+        )
     }
 
     pub fn store_unmap_snapshot_if_empty(
@@ -1462,6 +2066,15 @@ impl<W: LayoutElement> Tile<W> {
         xray_pos: XrayPos,
     ) -> TileRenderSnapshot {
         let _span = tracy_client::span!("Tile::render_snapshot");
+
+        // A shader that draws the close animation gets the snapshot without itself.
+        let close_shader = self
+            .shader_with_params(renderer)
+            .filter(|(shader, params)| shader.uses_close_progress(&params.user_uniforms))
+            .map(|(shader, params)| CloseShader { shader, params });
+        if let Some(state) = &self.shader {
+            state.suppressed.set(close_shader.is_some());
+        }
 
         let mut contents = Vec::new();
         self.render(
@@ -1547,6 +2160,10 @@ impl<W: LayoutElement> Tile<W> {
             &mut |elem| blocked_out_contents.push(elem),
         );
 
+        if let Some(state) = &self.shader {
+            state.suppressed.set(false);
+        }
+
         // Put everything back to normal.
         if let Some(xray) = &mut xray {
             if xray_has_blocked_out_layers {
@@ -1567,6 +2184,7 @@ impl<W: LayoutElement> Tile<W> {
             texture: Default::default(),
             texture_with_blocked_out_bg: Default::default(),
             blocked_out_texture: Default::default(),
+            close_shader,
         }
     }
 

@@ -40,8 +40,10 @@ pub mod layout;
 pub mod misc;
 pub mod output;
 pub mod recent_windows;
+pub mod shader_pipeline;
 pub mod utils;
 pub mod window_rule;
+pub mod window_shader;
 pub mod workspace;
 
 pub use crate::animations::{Animation, Animations};
@@ -57,11 +59,13 @@ pub use crate::misc::*;
 pub use crate::output::{Output, OutputName, Outputs, Position, Vrr};
 use crate::recent_windows::RecentWindowsPart;
 pub use crate::recent_windows::{MruDirection, MruFilter, MruPreviews, MruScope, RecentWindows};
+pub use crate::shader_pipeline::{PipelinePass, PipelineState, ShaderPipeline};
 pub use crate::utils::FloatOrInt;
 use crate::utils::{expand_home_path, Flag, MergeWith as _};
 pub use crate::window_rule::{
     FloatingPosition, OnXdgActivate, PopupsRule, RelativeTo, ResolvedPopupsRules, WindowRule,
 };
+pub use crate::window_shader::{ShaderInput, ShaderSource, WindowShader};
 pub use crate::workspace::{Workspace, WorkspaceLayoutPart};
 
 const RECURSION_LIMIT: u8 = 10;
@@ -1146,6 +1150,150 @@ mod tests {
     }
 
     #[test]
+    fn parse_window_shader() {
+        let parsed = do_parse(
+            r#"
+            window-rule {
+                shader "preset:crt" {
+                    uniform "intensity" 0.7
+                    uniform "tint" 0.2 1.0 0.6
+                    margin 24
+                }
+            }
+            window-rule {
+                shader r"vec4 window_color(vec3 c, vec3 s) { return vec4(1.0); }"
+            }
+            window-rule {
+                shader "/nonexistent/niri-test-shader.frag"
+            }
+            window-rule {
+                shader path="/nonexistent/niri-test-shader.frag" {
+                    input "backdrop"
+                    uniform "phase_01" time-scale=0.25
+                }
+            }
+            "#,
+        );
+
+        let shaders: Vec<_> = parsed
+            .window_rules
+            .iter()
+            .map(|rule| rule.shader.clone().unwrap())
+            .collect();
+
+        assert_eq!(shaders[0].source, ShaderSource::Preset(String::from("crt")));
+        assert_eq!(
+            shaders[0].uniforms,
+            vec![
+                (String::from("intensity"), vec![0.7]),
+                (String::from("tint"), vec![0.2, 1.0, 0.6]),
+            ]
+        );
+        assert_eq!(shaders[0].margin, Some(24.));
+
+        assert!(
+            matches!(&shaders[1].source, ShaderSource::Inline(code) if code.contains("window_color"))
+        );
+
+        assert_eq!(shaders[0].input, ShaderInput::Window);
+        assert_eq!(shaders[3].input, ShaderInput::Backdrop);
+        assert_eq!(
+            shaders[3].clock_uniforms,
+            [(String::from("phase_01"), 0.25)]
+        );
+
+        // A missing file is not a config error.
+        for shader in &shaders[2..] {
+            let ShaderSource::File { path, code } = &shader.source else {
+                panic!("expected a file: {shader:?}");
+            };
+            assert_eq!(path, Path::new("/nonexistent/niri-test-shader.frag"));
+            assert!(code.is_err());
+        }
+    }
+
+    #[test]
+    fn parse_shader_pipeline() {
+        let parsed = do_parse(
+            r#"
+            layer-rule {
+                match layer="background"
+                shader-pipeline {
+                    state "flow" scale=0.5
+                    state "step"
+                    pass "/nonexistent/flow.frag" target="flow" repeat=4 {
+                        uniform "speed" 2
+                    }
+                    pass "/nonexistent/step.frag" target="step" input="backdrop" {
+                        texture "field" from="flow"
+                    }
+                    draw "/nonexistent/draw.frag" behind=true {
+                        texture "flow" from="flow"
+                        texture "sharp" from="surface"
+                        uniform "phase" time-scale=0.5
+                    }
+                }
+            }
+            "#,
+        );
+
+        let pipeline = parsed.layer_rules[0].shader_pipeline.as_ref().unwrap();
+        assert_eq!(pipeline.states.len(), 2);
+        assert_eq!(pipeline.states[0].scale, 0.5);
+        assert_eq!(pipeline.states[1].scale, 1.);
+        assert_eq!(pipeline.passes[0].target.as_deref(), Some("flow"));
+        assert_eq!(pipeline.passes[0].repeat, 4);
+        assert_eq!(
+            pipeline.passes[0].uniforms,
+            [(String::from("speed"), vec![2.])]
+        );
+        assert_eq!(pipeline.passes[1].input.as_deref(), Some("backdrop"));
+        assert!(pipeline.behind);
+        assert!(pipeline.uses_backdrop());
+        assert_eq!(
+            pipeline.draw.textures,
+            [
+                (String::from("flow"), String::from("flow")),
+                (String::from("sharp"), String::from("surface")),
+            ]
+        );
+        assert_eq!(pipeline.draw.clock_uniforms, [(String::from("phase"), 0.5)]);
+    }
+
+    #[test]
+    fn parse_shader_pipeline_errors() {
+        for text in [
+            // No draw pass.
+            r#"layer-rule { shader-pipeline { state "a"; } }"#,
+            // A pass without a target.
+            r#"layer-rule { shader-pipeline { pass "/x.frag"; draw "/y.frag"; } }"#,
+            // An unknown state.
+            r#"layer-rule { shader-pipeline { draw "/y.frag" { texture "t" from="nope"; }; } }"#,
+            r#"layer-rule { shader-pipeline { pass "/x.frag" target="nope"; draw "/y.frag"; } }"#,
+            // The draw pass has no target.
+            r#"layer-rule { shader-pipeline { state "a"; draw "/y.frag" target="a"; } }"#,
+        ] {
+            assert!(Config::parse_mem(text).is_err(), "should fail: {text}");
+        }
+    }
+
+    #[test]
+    fn parse_window_shader_errors() {
+        for text in [
+            r#"window-rule { shader; }"#,
+            r#"window-rule { shader "preset:crt" { uniform "a" 1 2 3 4 5; } }"#,
+            r#"window-rule { shader "preset:crt" { uniform "not a name" 1; } }"#,
+            r#"window-rule { shader "preset:crt" { uniform "a"; } }"#,
+            r#"window-rule { shader "preset:crt" { margin -1; } }"#,
+            r#"window-rule { shader "preset:crt" { unknown 1; } }"#,
+            r#"window-rule { shader "preset:crt" { input "sideways"; } }"#,
+            r#"window-rule { shader "preset:crt" { uniform "t" 1 time-scale=1; } }"#,
+        ] {
+            assert!(Config::parse_mem(text).is_err(), "should fail: {text}");
+        }
+    }
+
+    #[test]
     fn parse() {
         let parsed = do_parse(
             r##"
@@ -1970,6 +2118,7 @@ mod tests {
                 center_focused_column: OnOverflow,
                 always_center_single_column: false,
                 empty_workspace_above_first: false,
+                floating_titlebars: false,
                 default_column_display: Tabbed,
                 gaps: 8.0,
                 struts: Struts {
@@ -2425,6 +2574,8 @@ mod tests {
                             saturation: None,
                         },
                     },
+                    shader: None,
+                    shader_pipeline: None,
                 },
             ],
             layer_rules: [
@@ -2480,6 +2631,7 @@ mod tests {
                             saturation: None,
                         },
                     },
+                    shader_pipeline: None,
                 },
             ],
             binds: Binds(

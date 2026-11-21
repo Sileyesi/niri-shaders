@@ -1,5 +1,5 @@
 use niri_config::utils::MergeWith as _;
-use niri_config::{Config, LayerRule};
+use niri_config::{Config, LayerRule, ShaderPipeline};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::desktop::{LayerSurface, PopupKind, PopupManager};
@@ -12,10 +12,14 @@ use crate::animation::Clock;
 use crate::layout::shadow::Shadow;
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
+use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::shader_element::ShaderRenderElement;
+use crate::render_helpers::shader_pipeline::{self, SurfacePipeline};
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
+use crate::render_helpers::window_shader::Backdrop;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{background_effect, RenderCtx};
 use crate::utils::{baba_is_float_offset, round_logical_in_physical};
@@ -53,6 +57,9 @@ pub struct MappedLayer {
 
     /// Clock for driving animations.
     clock: Clock,
+
+    /// State of the shader pipeline, if the rules give the surface one.
+    pipeline: Option<SurfacePipeline>,
 }
 
 niri_render_elements! {
@@ -61,6 +68,7 @@ niri_render_elements! {
         SolidColor = SolidColorRenderElement,
         Shadow = ShadowRenderElement,
         BackgroundEffect = BackgroundEffectElement,
+        Shader = ShaderRenderElement,
     }
 }
 
@@ -82,13 +90,17 @@ impl MappedLayer {
         Self {
             surface,
             pre_commit_hook,
-            rules,
             recompute_rules_on_commit: false,
             block_out_buffer: SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.]),
             view_size,
             scale,
             shadow: Shadow::new(shadow_config),
             blur_config: config.blur,
+            pipeline: rules
+                .shader_pipeline
+                .as_ref()
+                .map(|_| SurfacePipeline::default()),
+            rules,
             clock,
         }
     }
@@ -128,6 +140,32 @@ impl MappedLayer {
 
     pub fn are_animations_ongoing(&self) -> bool {
         self.rules.baba_is_float
+            || self
+                .pipeline
+                .as_ref()
+                .is_some_and(SurfacePipeline::needs_redraws)
+    }
+
+    /// Updates what the shader pipeline knows about the output, once a frame.
+    pub fn update_pipeline(&mut self, inputs: &shader_pipeline::Inputs) {
+        if let Some(pipeline) = &mut self.pipeline {
+            pipeline.update(self.clock.now(), inputs);
+        }
+    }
+
+    /// Drops a stone into the shader pipeline at a point in output-local coordinates.
+    pub fn drop_into_pipeline(
+        &mut self,
+        pos: Point<f64, Logical>,
+        output_size: Size<f64, Logical>,
+    ) -> bool {
+        match &mut self.pipeline {
+            Some(pipeline) => {
+                pipeline.drop_at(pos, output_size);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn surface(&self) -> &LayerSurface {
@@ -146,6 +184,11 @@ impl MappedLayer {
         }
 
         self.rules = new_rules;
+        match (&self.rules.shader_pipeline, &self.pipeline) {
+            (Some(_), None) => self.pipeline = Some(SurfacePipeline::default()),
+            (None, Some(_)) => self.pipeline = None,
+            _ => (),
+        }
         true
     }
 
@@ -219,23 +262,37 @@ impl MappedLayer {
             );
             push(elem.into());
         } else {
-            // Layer surfaces don't have extra geometry like windows.
-            let buf_pos = location;
+            let pipeline = self.render_pipeline(ctx.r(), ns, location, xray_pos, alpha);
 
-            push_elements_from_surface_tree(
-                ctx.renderer,
-                surface,
-                buf_pos.to_physical_precise_round(scale),
-                scale,
-                alpha,
-                Kind::ScanoutCandidate,
-                &mut |elem| push(elem.into()),
-            );
+            // The pipeline draws instead of the surface, or behind it.
+            let replaced = pipeline.as_ref().is_some_and(|(_, behind)| !behind);
+            if !replaced {
+                // Layer surfaces don't have extra geometry like windows.
+                let buf_pos = location;
+
+                push_elements_from_surface_tree(
+                    ctx.renderer,
+                    surface,
+                    buf_pos.to_physical_precise_round(scale),
+                    scale,
+                    alpha,
+                    Kind::ScanoutCandidate,
+                    &mut |elem| push(elem.into()),
+                );
+            }
+            if let Some((elem, _)) = pipeline {
+                push(elem.into());
+            }
         }
 
         let location = location.to_physical_precise_round(scale).to_logical(scale);
         self.shadow
             .render(ctx.renderer, location, &mut |elem| push(elem.into()));
+
+        // A pipeline that reads the backdrop draws it itself.
+        if self.pipeline_uses_backdrop() && !should_block_out {
+            return;
+        }
 
         let geometry = Rectangle::new(location, self.block_out_buffer.size());
         let surface_off = Point::new(0., 0.); // No geometry on layer surfaces.
@@ -257,6 +314,107 @@ impl MappedLayer {
             xray_pos,
             &mut |elem| push(elem.into()),
         );
+    }
+
+    fn pipeline_uses_backdrop(&self) -> bool {
+        self.pipeline.is_some()
+            && self
+                .rules
+                .shader_pipeline
+                .as_ref()
+                .is_some_and(ShaderPipeline::uses_backdrop)
+    }
+
+    /// Renders the surface through its shader pipeline, and returns the element with whether it
+    /// goes behind the surface.
+    ///
+    /// Returns `None` when there's no pipeline, it has nothing to show right now, or it fails, in
+    /// which case the surface should be rendered as usual.
+    fn render_pipeline<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        ns: Option<usize>,
+        location: Point<f64, Logical>,
+        xray_pos: XrayPos,
+        alpha: f32,
+    ) -> Option<(ShaderRenderElement, bool)> {
+        let (Some(pipeline), Some(config)) = (&self.pipeline, &self.rules.shader_pipeline) else {
+            return None;
+        };
+
+        let scale = Scale::from(self.scale);
+        let size = self.block_out_buffer.size();
+        let mut ctx = ctx.as_gles();
+
+        let mut elements = Vec::new();
+        push_elements_from_surface_tree(
+            ctx.renderer,
+            self.surface.wl_surface(),
+            Point::from((0, 0)),
+            scale,
+            1.,
+            Kind::Unspecified,
+            &mut |elem| elements.push(elem),
+        );
+
+        // Top and overlay surfaces are over windows, which xray doesn't show. Their pipelines take
+        // the real backdrop from the framebuffer, like floating windows, and blur it themselves,
+        // only where they draw.
+        let effect = self.rules.background_effect;
+        let from_framebuffer = config.uses_backdrop()
+            && effect.xray.is_none()
+            && matches!(self.surface.layer(), Layer::Top | Layer::Overlay);
+        let backdrop_blur =
+            (from_framebuffer && effect.blur == Some(true) && !self.blur_config.off)
+                .then(|| BlurOptions::from(self.blur_config));
+
+        // What's behind the surface, with the surface at (0, 0).
+        let mut backdrop = Vec::new();
+        if config.uses_backdrop() && !from_framebuffer {
+            background_effect::render_for_tile(
+                ctx.r(),
+                ns,
+                Rectangle::from_size(size),
+                self.scale,
+                false,
+                self.surface.wl_surface(),
+                Point::new(0., 0.),
+                Scale::from(1.),
+                self.blur_config,
+                self.rules.geometry_corner_radius.unwrap_or_default(),
+                self.rules.background_effect,
+                false,
+                xray_pos,
+                &mut |elem| backdrop.push(elem),
+            );
+        }
+
+        let location = location.to_physical_precise_round(scale).to_logical(scale);
+        let res = pipeline.render(
+            ctx.renderer,
+            config,
+            &elements,
+            if from_framebuffer {
+                Backdrop::Framebuffer
+            } else if config.uses_backdrop() {
+                Backdrop::Elements(&backdrop[..])
+            } else {
+                Backdrop::None
+            },
+            backdrop_blur,
+            size,
+            scale,
+            location,
+            alpha,
+            self.clock.now(),
+        );
+        match res {
+            Ok(elem) => elem.map(|elem| (elem, config.behind)),
+            Err(err) => {
+                warn!("error rendering the layer shader pipeline: {err:?}");
+                None
+            }
+        }
     }
 
     pub fn render_popups<R: NiriRenderer>(

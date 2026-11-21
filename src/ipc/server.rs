@@ -38,6 +38,7 @@ use crate::layout::workspace::WorkspaceId;
 use crate::niri::State;
 use crate::utils::{version, with_toplevel_role};
 use crate::window::Mapped;
+use crate::window_shader;
 
 // If an event stream client fails to read events fast enough that we accumulate more than this
 // number in our buffer, we drop that event stream client.
@@ -458,6 +459,15 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let state = ctx.event_stream_state.borrow();
             let casts = state.casts.casts.values().cloned().collect();
             Response::Casts(casts)
+        }
+        Request::WindowShader(request) => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let result = window_shader::handle_request(state, request);
+                let _ = tx.send_blocking(result);
+            });
+            let result = rx.recv().await;
+            result.map_err(|_| String::from("error getting the window shader result"))??
         }
     };
 

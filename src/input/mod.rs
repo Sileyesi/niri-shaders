@@ -55,13 +55,15 @@ use crate::dbus::freedesktop_a11y::KbMonBlock;
 #[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell::GlobalShortcutsPortalBinds;
 use crate::layout::scrolling::ScrollDirection;
-use crate::layout::{ActivateWindow, LayoutElement as _};
+use crate::layout::titlebar::TitleBarPart;
+use crate::layout::{ActivateWindow, HitType, LayoutElement as _};
 use crate::niri::{CastTarget, Niri, PointerVisibility, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
-use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
+use crate::utils::{center, get_monotonic_time, output_size, CastSessionId, ResizeEdge};
 use crate::window::mapped::MappedId;
+use crate::window_shader;
 
 pub mod backend_ext;
 pub mod click_grab;
@@ -2509,6 +2511,11 @@ impl State {
                     self.niri.queue_redraw_all();
                 }
             }
+            Action::ToggleAllWindowsFloating => {
+                self.niri.layout.toggle_all_windows_floating();
+                // FIXME: granular
+                self.niri.queue_redraw_all();
+            }
             Action::FocusFloating => {
                 self.niri.layout.focus_floating();
                 self.maybe_warp_cursor_to_focus();
@@ -2544,6 +2551,52 @@ impl State {
                     .move_floating_window(window.as_ref(), x, y, true);
                 // FIXME: granular
                 self.niri.queue_redraw_all();
+            }
+            Action::ShaderPipelineSplash => {
+                let pointer = self.niri.seat.get_pointer().unwrap().current_location();
+
+                // Into the window under the pointer, if it has a pipeline.
+                let mut splashed = false;
+                if let Some((window, HitType::Input { win_pos })) =
+                    &self.niri.pointer_contents.window
+                {
+                    let surface = window.toplevel().unwrap().wl_surface().clone();
+                    let win_pos = *win_pos;
+                    if let Some((mapped, output)) =
+                        self.niri.layout.find_window_and_output(&surface)
+                    {
+                        // win_pos is where the buffer is, which is offset from the geometry.
+                        let pos = pointer - win_pos + mapped.buf_loc().to_f64();
+                        if mapped.drop_into_pipeline(pos) {
+                            splashed = true;
+                            if let Some(output) = output.cloned() {
+                                self.niri.queue_redraw(&output);
+                            }
+                        }
+                    }
+                }
+
+                // Otherwise into the layer surfaces of the output.
+                let output_under = self.niri.output_under(pointer).filter(|_| !splashed);
+                if let Some((output, pos)) = output_under {
+                    let output = output.clone();
+                    let size = output_size(&output);
+                    let mut splashed = false;
+                    for surface in layer_map_for_output(&output).layers() {
+                        if let Some(mapped) = self.niri.mapped_layer_surfaces.get_mut(surface) {
+                            splashed |= mapped.drop_into_pipeline(pos, size);
+                        }
+                    }
+                    if splashed {
+                        self.niri.queue_redraw(&output);
+                    }
+                }
+            }
+            Action::CycleWindowShader => {
+                window_shader::cycle(self, None);
+            }
+            Action::CycleWindowShaderById(id) => {
+                window_shader::cycle(self, Some(id));
             }
             Action::ToggleWindowRuleOpacity => {
                 let active_window = self
@@ -2970,6 +3023,7 @@ impl State {
         self.niri.handle_focus_follows_mouse(&under);
 
         self.niri.pointer_contents.clone_from(&under);
+        self.niri.update_window_shader_pointer(new_pos);
 
         pointer.motion(
             self,
@@ -3071,6 +3125,7 @@ impl State {
         self.niri.handle_focus_follows_mouse(&under);
 
         self.niri.pointer_contents.clone_from(&under);
+        self.niri.update_window_shader_pointer(pos);
 
         pointer.motion(
             self,
@@ -3311,6 +3366,65 @@ impl State {
 
             if let Some(mapped) = self.niri.window_under_cursor() {
                 let window = mapped.window.clone();
+
+                // The title bars of floating windows: the buttons, and the title that moves the
+                // window, or maximizes it on a double click.
+                let titlebar = if button == Some(MouseButton::Left)
+                    && !pointer.is_grabbed()
+                    && !is_overview_open
+                    && !mod_down
+                {
+                    let location = pointer.current_location();
+                    self.niri
+                        .output_under(location)
+                        .and_then(|(output, pos)| self.niri.layout.titlebar_under(output, pos))
+                        .filter(|(w, _)| w.window == window)
+                        .map(|(_, part)| part)
+                } else {
+                    None
+                };
+                let titlebar_fill = match titlebar {
+                    Some(TitleBarPart::Close) => {
+                        mapped.toplevel().send_close();
+                        false
+                    }
+                    Some(TitleBarPart::Maximize) => true,
+                    Some(TitleBarPart::Title) => mapped.titlebar_clicked(get_monotonic_time()),
+                    None => false,
+                };
+                if matches!(titlebar, Some(TitleBarPart::Close)) || titlebar_fill {
+                    self.niri.layout.activate_window(&window);
+                    if titlebar_fill {
+                        self.niri.layout.toggle_window_fill(&window);
+                    }
+                    self.niri.suppressed_buttons.insert(button_code);
+                    // FIXME: granular.
+                    self.niri.queue_redraw_all();
+                    return;
+                }
+                if titlebar == Some(TitleBarPart::Title) {
+                    let start_data = PointerGrabStartData {
+                        focus: None,
+                        button: button_code,
+                        location: pointer.current_location(),
+                    };
+                    let start_data = AnyStartData::Pointer(start_data);
+                    if let Some(grab) = MoveGrab::new(
+                        self,
+                        start_data,
+                        window.clone(),
+                        false,
+                        Some(CursorIcon::Grabbing),
+                    ) {
+                        pointer.set_grab(self, grab, serial, Focus::Clear);
+                    }
+                    // The grab ends when the button is released, the window doesn't get the
+                    // press.
+                    self.niri.layout.activate_window(&window);
+                    // FIXME: granular.
+                    self.niri.queue_redraw_all();
+                    return;
+                }
 
                 // Check if we need to start an interactive move.
                 if button == Some(MouseButton::Left) && !pointer.is_grabbed() {

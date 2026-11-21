@@ -1583,6 +1583,18 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
+    pub fn titlebar_under(
+        &self,
+        pos_within_output: Point<f64, Logical>,
+    ) -> Option<(&W, super::titlebar::TitleBarPart)> {
+        if self.overview_progress.is_some() {
+            return None;
+        }
+
+        let (ws, geo) = self.workspace_under(pos_within_output)?;
+        ws.titlebar_under(pos_within_output - geo.loc)
+    }
+
     pub fn resize_edges_under(&self, pos_within_output: Point<f64, Logical>) -> Option<ResizeEdge> {
         if self.overview_progress.is_some() {
             return None;

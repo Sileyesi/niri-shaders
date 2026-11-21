@@ -1,4 +1,5 @@
 use crate::appearance::{BackgroundEffectRule, BlockOutFrom, CornerRadius, ShadowRule};
+use crate::shader_pipeline::ShaderPipeline;
 use crate::utils::RegexEq;
 use crate::window_rule::PopupsRule;
 
@@ -27,6 +28,8 @@ pub struct LayerRule {
     pub background_effect: BackgroundEffectRule,
     #[knuffel(child, default)]
     pub popups: PopupsRule,
+    #[knuffel(child)]
+    pub shader_pipeline: Option<ShaderPipeline>,
 }
 
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]

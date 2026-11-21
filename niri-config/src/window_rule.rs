@@ -6,7 +6,9 @@ use crate::appearance::{
     TabIndicatorRule,
 };
 use crate::layout::DefaultPresetSize;
+use crate::shader_pipeline::ShaderPipeline;
 use crate::utils::{MergeWith, RegexEq};
+use crate::window_shader::WindowShader;
 use crate::FloatOrInt;
 
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
@@ -84,6 +86,10 @@ pub struct WindowRule {
     pub background_effect: BackgroundEffectRule,
     #[knuffel(child, default)]
     pub popups: PopupsRule,
+    #[knuffel(child)]
+    pub shader: Option<WindowShader>,
+    #[knuffel(child)]
+    pub shader_pipeline: Option<ShaderPipeline>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

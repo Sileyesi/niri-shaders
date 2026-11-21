@@ -1,6 +1,8 @@
 use niri_config::layer_rule::{LayerRule, Match};
 use niri_config::utils::MergeWith as _;
-use niri_config::{BackgroundEffect, BlockOutFrom, CornerRadius, ResolvedPopupsRules, ShadowRule};
+use niri_config::{
+    BackgroundEffect, BlockOutFrom, CornerRadius, ResolvedPopupsRules, ShaderPipeline, ShadowRule,
+};
 use smithay::desktop::LayerSurface;
 use smithay::wayland::shell::wlr_layer::Layer;
 
@@ -36,6 +38,9 @@ pub struct ResolvedLayerRules {
 
     /// Rules for this layer surface's popups.
     pub popups: ResolvedPopupsRules,
+
+    /// Shader passes to draw this layer surface with.
+    pub shader_pipeline: Option<ShaderPipeline>,
 }
 
 impl ResolvedLayerRules {
@@ -89,6 +94,10 @@ impl ResolvedLayerRules {
                 .merge_with(&rule.background_effect);
 
             resolved.popups.merge_with(&rule.popups);
+
+            if let Some(x) = &rule.shader_pipeline {
+                resolved.shader_pipeline = Some(x.clone());
+            }
         }
 
         resolved

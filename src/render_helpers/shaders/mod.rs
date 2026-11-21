@@ -9,6 +9,7 @@ use smithay::backend::renderer::gles::{
 use super::renderer::NiriRenderer;
 use super::shader_element::ShaderProgram;
 use crate::render_helpers::blur::BlurProgram;
+use crate::render_helpers::window_shader::WindowShaderPrograms;
 
 pub struct Shaders {
     pub border: Option<ShaderProgram>,
@@ -21,6 +22,7 @@ pub struct Shaders {
     pub custom_resize: RefCell<Option<ShaderProgram>>,
     pub custom_close: RefCell<Option<ShaderProgram>>,
     pub custom_open: RefCell<Option<ShaderProgram>>,
+    pub window: RefCell<WindowShaderPrograms>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -30,6 +32,8 @@ pub enum ProgramType {
     Resize,
     Close,
     Open,
+    /// Window shader, by the hash of its code.
+    Window(u64),
 }
 
 impl Shaders {
@@ -159,6 +163,7 @@ impl Shaders {
             custom_resize: RefCell::new(None),
             custom_close: RefCell::new(None),
             custom_open: RefCell::new(None),
+            window: RefCell::default(),
         }
     }
 
@@ -207,6 +212,7 @@ impl Shaders {
                 .or_else(|| self.resize.clone()),
             ProgramType::Close => self.custom_close.borrow().clone(),
             ProgramType::Open => self.custom_open.borrow().clone(),
+            ProgramType::Window(key) => self.window.borrow().get(key),
         }
     }
 }

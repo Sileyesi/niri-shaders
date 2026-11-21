@@ -119,6 +119,41 @@ pub enum Request {
     OverviewState,
     /// Request information about screencasts.
     Casts,
+    /// Change or list the shaders that windows are drawn with.
+    WindowShader(WindowShaderRequest),
+}
+
+/// Changes to the shaders that windows are drawn with.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "clap", derive(clap::Subcommand))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum WindowShaderRequest {
+    /// Draw a window with a shader.
+    ///
+    /// Takes precedence over the `shader` window rule until cleared. A shader file is watched and
+    /// reloaded when it changes.
+    Set {
+        /// Id of the window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+        /// Preset name (like `crt` or `preset:crt`), path to a `.frag` file, or shader code.
+        shader: String,
+    },
+    /// Go back to the shader from the window rules, or none.
+    Clear {
+        /// Id of the window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+        /// Draw the window without a shader, even if the window rules give it one.
+        #[cfg_attr(feature = "clap", arg(long))]
+        none: bool,
+    },
+    /// List the shader presets and the windows that have shaders.
+    List,
 }
 
 /// Reply from niri to client.
@@ -165,6 +200,42 @@ pub enum Response {
     OverviewState(Overview),
     /// Information about screencasts.
     Casts(Vec<Cast>),
+    /// Information about window shaders.
+    WindowShaders(WindowShaders),
+}
+
+/// Shader presets and the windows that have shaders.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WindowShaders {
+    /// Names of the presets built into niri.
+    pub presets: Vec<String>,
+    /// Windows that have a shader.
+    pub windows: Vec<WindowShaderInfo>,
+}
+
+/// The shader of a window.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WindowShaderInfo {
+    /// Id of the window.
+    pub window_id: u64,
+    /// App id of the window.
+    pub app_id: Option<String>,
+    /// Title of the window.
+    pub title: Option<String>,
+    /// Name of the shader: its path, `preset:name` or `inline`.
+    pub shader: String,
+    /// Whether the shader was set at runtime rather than by the window rules.
+    pub is_override: bool,
+    /// Format of the shader, `niri` or `ShojiWM`, if it compiled.
+    pub format: Option<String>,
+    /// Whether the shader changes over time, so the window is redrawn every frame.
+    pub animated: bool,
+    /// Why the shader can't be used, with the compiler log. The window is drawn without it then.
+    pub error: Option<String>,
+    /// Problems that don't stop the shader from working, like unused uniforms.
+    pub warnings: Vec<String>,
 }
 
 /// Overview information.
@@ -992,6 +1063,11 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         id: Option<u64>,
     },
+    /// Move all windows to the floating layout, or back to tiling if none of them are tiled.
+    ///
+    /// Back in tiling, the windows of each workspace go in columns left to right, as they are on
+    /// screen.
+    ToggleAllWindowsFloating {},
     /// Switches focus to the floating layout.
     FocusFloating {},
     /// Switches focus to the tiling layout.
@@ -1022,6 +1098,28 @@ pub enum Action {
             arg(short, long, default_value = "+0", allow_hyphen_values = true)
         )]
         y: PositionChange,
+    },
+    /// Drop a stone into the layer shader pipelines under the pointer.
+    ///
+    /// Like the water drop of the ShojiWM liquid-desktop config.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Drop a stone into the layer shader pipelines under the pointer")
+    )]
+    ShaderPipelineSplash {},
+    /// Draw the focused window with the next shader preset.
+    ///
+    /// Goes through the presets, then back to the shader from the window rules.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Draw the focused window with the next shader preset")
+    )]
+    CycleWindowShader {
+        /// Id of the window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
     },
     /// Toggle the opacity of a window.
     #[cfg_attr(

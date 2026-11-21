@@ -7,6 +7,7 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::{render_to_encompassing_texture, ToRenderElement};
+use crate::render_helpers::window_shader::CloseShader;
 use crate::render_helpers::{RenderCtx, RenderTarget};
 
 /// Snapshot of a render.
@@ -42,6 +43,11 @@ pub struct RenderSnapshot<C, B> {
 
     /// Blocked-out contents rendered into a texture (lazily).
     pub blocked_out_texture: OnceCell<Option<(GlesTexture, Rectangle<i32, Physical>)>>,
+
+    /// Window shader that draws the close animation, for snapshots of tiles with one.
+    ///
+    /// The contents are without the shader then.
+    pub close_shader: Option<CloseShader>,
 }
 
 impl<C, B, EC, EB> RenderSnapshot<C, B>

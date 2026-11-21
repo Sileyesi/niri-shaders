@@ -11,6 +11,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::scrolling::ColumnWidth;
 use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
+use super::titlebar::TITLEBAR_HEIGHT;
 use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, Options, RemovedTile, SizeFrac,
@@ -229,10 +230,19 @@ impl<W: LayoutElement> FloatingSpace<W> {
         scale: f64,
         options: Rc<Options>,
     ) {
+        // When only the working area changes, like when a bar comes or goes, the windows glide
+        // to their new places.
+        let animate =
+            self.working_area != working_area && self.view_size == view_size && self.scale == scale;
+
         for (tile, data) in zip(&mut self.tiles, &mut self.data) {
+            let old_pos = data.logical_pos;
             tile.update_config(view_size, scale, options.clone());
             data.update(tile);
             data.update_config(working_area);
+            if animate && data.logical_pos != old_pos {
+                tile.animate_move_from(old_pos - data.logical_pos);
+            }
         }
 
         self.view_size = view_size;
@@ -353,7 +363,16 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
     pub fn new_window_toplevel_bounds(&self, rules: &ResolvedWindowRules) -> Size<i32, Logical> {
         let border_config = self.options.layout.border.merged_with(&rules.border);
-        compute_toplevel_bounds(border_config, self.working_area.size)
+        compute_toplevel_bounds(border_config, self.bounds_area())
+    }
+
+    /// Area for the windows, without their title bars.
+    fn bounds_area(&self) -> Size<f64, Logical> {
+        let mut size = self.working_area.size;
+        if self.options.layout.floating_titlebars {
+            size.h = f64::max(1., size.h - TITLEBAR_HEIGHT);
+        }
+        size
     }
 
     /// Returns the geometry of the active window relative to and clamped to the working area.
@@ -423,6 +442,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
     }
 
     fn add_tile_at(&mut self, mut idx: usize, mut tile: Tile<W>, activate: bool) {
+        tile.is_floating = true;
         tile.update_config(self.view_size, self.scale, self.options.clone());
 
         // Restore the previous floating window size, and in case the tile is fullscreen,
@@ -438,6 +458,13 @@ impl<W: LayoutElement> FloatingSpace<W> {
             // fullscreen until now), fall back to (0, 0).
             floating_size.unwrap_or_else(|| win.expected_size().unwrap_or_default())
         };
+
+        // A window coming from tiling keeps the height of its tile, with the title bar.
+        let titlebar = tile.titlebar_height();
+        if floating_size.is_none() && titlebar > 0. && size.h > 0 {
+            size.h = i32::max(1, size.h - titlebar as i32);
+        }
+        let win = tile.window_mut();
 
         // Apply min/max size window rules. If requesting a concrete size, apply completely; if
         // requesting (0, 0), apply only when min/max results in a fixed size.
@@ -520,6 +547,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
     fn remove_tile_by_idx(&mut self, idx: usize) -> RemovedTile<W> {
         let mut tile = self.tiles.remove(idx);
         let data = self.data.remove(idx);
+        tile.is_floating = false;
+        tile.floating_restore = None;
 
         if self.tiles.is_empty() {
             self.active_window_id = None;
@@ -1011,6 +1040,42 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.move_to(idx, pos, animate);
     }
 
+    /// Makes the window fill the working area, or puts it back where it was, like the maximize
+    /// button of the title bar.
+    pub fn toggle_window_fill(&mut self, id: &W::Id) {
+        let Some(idx) = self.idx_of(id) else {
+            return;
+        };
+
+        let tile = &mut self.tiles[idx];
+        let (pos, win_size) = if let Some(restore) = tile.floating_restore.take() {
+            restore
+        } else {
+            let win = tile.window();
+            let current = win.expected_size().unwrap_or_else(|| win.size());
+            tile.floating_restore = Some((self.data[idx].logical_pos, current));
+
+            let area = self.working_area;
+            let size = Size::from((
+                tile.window_width_for_tile_width(area.size.w),
+                tile.window_height_for_tile_height(area.size.h),
+            ));
+            (area.loc, size.to_i32_floor())
+        };
+
+        let win = tile.window_mut();
+        let min_size = win.min_size();
+        let max_size = win.max_size();
+        let win_size = Size::from((
+            ensure_min_max_size(win_size.w, min_size.w, max_size.w),
+            ensure_min_max_size(win_size.h, min_size.h, max_size.h),
+        ));
+        win.request_size_once(win_size, true);
+
+        self.move_and_animate(idx, pos);
+        self.interactive_resize_end(None);
+    }
+
     pub fn center_window(&mut self, id: Option<&W::Id>) {
         let Some(id) = id.or(self.active_window_id.as_ref()).cloned() else {
             return;
@@ -1182,6 +1247,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
     pub fn refresh(&mut self, is_active: bool, is_focused: bool) {
         let active = self.active_window_id.clone();
+        let bounds_area = self.bounds_area();
         for tile in &mut self.tiles {
             let win = tile.window_mut();
 
@@ -1202,7 +1268,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             win.set_interactive_resize(resize_data);
 
             let border_config = self.options.layout.border.merged_with(&win.rules().border);
-            let bounds = compute_toplevel_bounds(border_config, self.working_area.size);
+            let bounds = compute_toplevel_bounds(border_config, bounds_area);
             win.set_bounds(bounds);
 
             // If transactions are disabled, also disable combined throttling, for more

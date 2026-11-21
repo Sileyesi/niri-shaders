@@ -9,6 +9,7 @@ use niri_ipc::socket::Socket;
 use niri_ipc::{
     Action, Cast, CastKind, CastTarget, Event, KeyboardLayouts, LogicalOutput, Mode, Output,
     OutputConfigChanged, Overview, Request, Response, Transform, Window, WindowLayout,
+    WindowShaderRequest, WindowShaders,
 };
 use serde_json::json;
 
@@ -26,6 +27,16 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
     {
         if let Some(path) = path {
             ensure_absolute_path(path).context("error making the path absolute")?;
+        }
+    }
+
+    // Shader files are read by niri, so make their paths absolute too.
+    if let Msg::WindowShader {
+        request: WindowShaderRequest::Set { shader, .. },
+    } = &mut msg
+    {
+        if Path::new(shader).is_file() {
+            ensure_absolute_path(shader).context("error making the path absolute")?;
         }
     }
 
@@ -49,6 +60,7 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
         Msg::RequestError => Request::ReturnError,
         Msg::OverviewState => Request::OverviewState,
         Msg::Casts => Request::Casts,
+        Msg::WindowShader { request } => Request::WindowShader(request.clone()),
         Msg::RawRequest => {
             let mut buf = Vec::new();
             let mut stdin = std::io::stdin().lock();
@@ -569,6 +581,24 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
                 println!();
             }
         }
+        Msg::WindowShader { request } => {
+            if !matches!(request, WindowShaderRequest::List) {
+                return Ok(());
+            }
+
+            let Response::WindowShaders(shaders) = response else {
+                bail!("unexpected response: expected WindowShaders, got {response:?}");
+            };
+
+            if json {
+                let shaders =
+                    serde_json::to_string(&shaders).context("error formatting response")?;
+                println!("{shaders}");
+                return Ok(());
+            }
+
+            print_window_shaders(&shaders);
+        }
         Msg::RawRequest => {
             let output = serde_json::to_string(&response).context("error formatting response")?;
             println!("{output}");
@@ -819,6 +849,51 @@ fn fmt_rounded(x: f64) -> String {
         format!("{r}")
     } else {
         format!("{x:.2}")
+    }
+}
+
+fn print_window_shaders(shaders: &WindowShaders) {
+    println!("Presets: {}", shaders.presets.join(", "));
+
+    if shaders.windows.is_empty() {
+        println!("\nNo windows have shaders.");
+        return;
+    }
+
+    for info in &shaders.windows {
+        println!();
+        println!("Window ID {}:", info.window_id);
+        if let Some(app_id) = &info.app_id {
+            println!("  App ID: \"{app_id}\"");
+        }
+        if let Some(title) = &info.title {
+            println!("  Title: \"{title}\"");
+        }
+
+        let source = if info.is_override {
+            "set at runtime"
+        } else {
+            "from window rules"
+        };
+        println!("  Shader: {} ({source})", info.shader);
+
+        if let Some(format) = &info.format {
+            let animated = if info.animated {
+                ", redrawn every frame"
+            } else {
+                ""
+            };
+            println!("  Format: {format}{animated}");
+        }
+        if let Some(error) = &info.error {
+            println!("  Error, drawn without the shader:");
+            for line in error.lines() {
+                println!("    {line}");
+            }
+        }
+        for warning in &info.warnings {
+            println!("  Warning: {warning}");
+        }
     }
 }
 

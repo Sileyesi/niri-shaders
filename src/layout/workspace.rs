@@ -1452,26 +1452,14 @@ impl<W: LayoutElement> Workspace<W> {
                 self.floating_is_active = FloatingActive::No;
             }
         } else {
-            let mut removed = self.scrolling.remove_tile(&id, Transaction::new());
-            removed.tile.stop_move_animations();
-
-            // Come up with a default floating position close to the tile position.
-            let stored_or_default = self.floating.stored_or_default_tile_pos(&removed.tile);
-            if stored_or_default.is_none() {
-                let offset =
-                    if self.options.layout.center_focused_column == CenterFocusedColumn::Always {
-                        Point::from((0., 0.))
-                    } else {
-                        Point::from((50., 50.))
-                    };
-                let pos = render_pos + offset;
-                let size = removed.tile.tile_size();
-                let pos = self.floating.clamp_within_working_area(pos, size);
-                let pos = self.floating.logical_to_size_frac(pos);
-                removed.tile.floating_pos = Some(pos);
-            }
-
-            self.floating.add_tile(removed.tile, target_is_active);
+            // Offset the window a bit, so that it's clear that it now floats.
+            let offset = if self.options.layout.center_focused_column == CenterFocusedColumn::Always
+            {
+                Point::from((0., 0.))
+            } else {
+                Point::from((50., 50.))
+            };
+            self.move_tile_to_floating(&id, render_pos + offset, target_is_active);
             if target_is_active {
                 self.floating_is_active = FloatingActive::Yes;
             }
@@ -1483,6 +1471,81 @@ impl<W: LayoutElement> Workspace<W> {
             .unwrap();
 
         tile.animate_move_from(render_pos - new_render_pos);
+    }
+
+    /// Moves a tile from the scrolling layout to the floating one at `pos`, unless it has a
+    /// floating position from before.
+    fn move_tile_to_floating(&mut self, id: &W::Id, pos: Point<f64, Logical>, activate: bool) {
+        let mut removed = self.scrolling.remove_tile(id, Transaction::new());
+        removed.tile.stop_move_animations();
+
+        let stored_or_default = self.floating.stored_or_default_tile_pos(&removed.tile);
+        if stored_or_default.is_none() {
+            let size = removed.tile.tile_size();
+            let pos = self.floating.clamp_within_working_area(pos, size);
+            let pos = self.floating.logical_to_size_frac(pos);
+            removed.tile.floating_pos = Some(pos);
+        }
+
+        self.floating.add_tile(removed.tile, activate);
+    }
+
+    pub fn has_tiled_windows(&self) -> bool {
+        !self.scrolling.is_empty()
+    }
+
+    /// Moves all windows to the floating layout, or all of them to the tiling layout.
+    ///
+    /// Back in tiling, the columns go left to right in the order the windows are on screen.
+    pub fn set_all_windows_floating(&mut self, floating: bool) {
+        // With no tiles, the window to focus is the floating one even when tiling is active.
+        let active_id = self
+            .active_window()
+            .or_else(|| self.floating.active_window())
+            .map(|win| win.id().clone());
+
+        // Where the windows are now, to animate from.
+        let mut moving: Vec<_> = self
+            .tiles_with_render_positions()
+            .filter(|(tile, _, _)| self.floating.has_window(tile.window().id()) != floating)
+            .map(|(tile, pos, _)| (tile.window().id().clone(), pos))
+            .collect();
+        if moving.is_empty() {
+            return;
+        }
+
+        if floating {
+            // The windows float right where they are, so that the screen looks the same. Every
+            // tile goes on top of the floating ones, so the active one goes last.
+            moving.sort_by_key(|(id, _)| Some(id) == active_id.as_ref());
+            for (id, pos) in &moving {
+                let activate = Some(id) == active_id.as_ref();
+                self.move_tile_to_floating(id, *pos, activate);
+            }
+            self.floating_is_active = FloatingActive::Yes;
+        } else {
+            moving.sort_by(|(_, a), (_, b)| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+            for (id, _) in &moving {
+                let removed = self.floating.remove_tile(id);
+                let activate = Some(id) == active_id.as_ref();
+                let idx = self.scrolling.columns().count();
+                self.scrolling.add_tile(
+                    Some(idx),
+                    removed.tile,
+                    activate,
+                    removed.width,
+                    removed.is_full_width,
+                    None,
+                );
+            }
+            self.floating_is_active = FloatingActive::No;
+        }
+
+        for (tile, new_pos) in self.tiles_with_render_positions_mut(false) {
+            if let Some((_, pos)) = moving.iter().find(|(id, _)| id == tile.window().id()) {
+                tile.animate_move_from(*pos - new_pos);
+            }
+        }
     }
 
     pub fn set_window_floating(&mut self, id: Option<&W::Id>, floating: bool) {
@@ -1816,6 +1879,32 @@ impl<W: LayoutElement> Workspace<W> {
         }
 
         self.scrolling.window_under(pos)
+    }
+
+    pub fn titlebar_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(&W, super::titlebar::TitleBarPart)> {
+        // The topmost tile under the point decides, like in window_under().
+        self.tiles_with_render_positions()
+            .find_map(|(tile, tile_pos, visible)| {
+                if !visible {
+                    return None;
+                }
+                let pos_within_tile = pos - tile_pos;
+                tile.hit(pos_within_tile)?;
+                Some(
+                    tile.titlebar_part(pos_within_tile)
+                        .map(|part| (tile.window(), part)),
+                )
+            })
+            .flatten()
+    }
+
+    pub fn toggle_window_fill(&mut self, id: &W::Id) {
+        if self.floating.has_window(id) {
+            self.floating.toggle_window_fill(id);
+        }
     }
 
     pub fn resize_edges_under(&self, pos: Point<f64, Logical>) -> Option<ResizeEdge> {

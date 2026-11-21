@@ -26,6 +26,7 @@ use self::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::renderer::AsGlesRenderer;
 use crate::render_helpers::xray::Xray;
 
+pub mod backdrop_glass;
 pub mod background_effect;
 pub mod blur;
 pub mod border;
@@ -43,12 +44,14 @@ pub mod renderer;
 pub mod resize;
 pub mod resources;
 pub mod shader_element;
+pub mod shader_pipeline;
 pub mod shaders;
 pub mod shadow;
 pub mod snapshot;
 pub mod solid_color;
 pub mod surface;
 pub mod texture;
+pub mod window_shader;
 pub mod xray;
 
 /// A rendering context.

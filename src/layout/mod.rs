@@ -74,6 +74,7 @@ use crate::utils::{
     round_logical_in_physical_max1, ResizeEdge,
 };
 use crate::window::ResolvedWindowRules;
+use crate::window_shader::ResolvedShader;
 
 pub mod closing_window;
 pub mod floating;
@@ -85,6 +86,7 @@ pub mod scrolling;
 pub mod shadow;
 pub mod tab_indicator;
 pub mod tile;
+pub mod titlebar;
 pub mod workspace;
 
 #[cfg(test)]
@@ -326,6 +328,33 @@ pub trait LayoutElement {
     fn is_child_of(&self, parent: &Self) -> bool;
 
     fn rules(&self) -> &ResolvedWindowRules;
+
+    /// The shader to draw the element with, if any.
+    fn window_shader(&self) -> Option<&ResolvedShader> {
+        None
+    }
+
+    /// Position of the pointer relative to the element's visual geometry, if it's over the
+    /// element.
+    fn pointer_position(&self) -> Option<Point<f64, Logical>> {
+        None
+    }
+
+    /// Takes the stone to drop into the element's shader pipeline, relative to its visual
+    /// geometry.
+    fn take_pipeline_drop(&self) -> Option<Point<f64, Logical>> {
+        None
+    }
+
+    /// Title for the title bar.
+    fn title(&self) -> Option<String> {
+        None
+    }
+
+    /// Part of the title bar under the pointer.
+    fn titlebar_hover(&self) -> Option<titlebar::TitleBarPart> {
+        None
+    }
 
     /// Runs periodic clean-up tasks.
     fn refresh(&self);
@@ -2405,6 +2434,36 @@ impl<W: LayoutElement> Layout<W> {
         mon.resize_edges_under(pos_within_output)
     }
 
+    /// The window whose title bar is under the point, and the part of it.
+    pub fn titlebar_under(
+        &self,
+        output: &Output,
+        pos_within_output: Point<f64, Logical>,
+    ) -> Option<(&W, titlebar::TitleBarPart)> {
+        if self
+            .interactive_moved_window_under(output, pos_within_output)
+            .is_some()
+        {
+            return None;
+        }
+        let mon = self.monitor_for_output(output)?;
+        mon.titlebar_under(pos_within_output)
+    }
+
+    /// Makes a floating window fill the working area, or puts it back, like the maximize button
+    /// of its title bar.
+    pub fn toggle_window_fill(&mut self, id: &W::Id) {
+        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            if move_.tile.window().id() == id {
+                return;
+            }
+        }
+
+        if let Some(ws) = self.workspaces_mut().find(|ws| ws.has_window(id)) {
+            ws.toggle_window_fill(id);
+        }
+    }
+
     pub fn workspace_under(
         &self,
         extended_bounds: bool,
@@ -3238,6 +3297,16 @@ impl<W: LayoutElement> Layout<W> {
         workspace.toggle_window_floating(window);
     }
 
+    /// Moves all windows on all workspaces to the floating layout, or back to tiling if none of
+    /// them are tiled.
+    pub fn toggle_all_windows_floating(&mut self) {
+        // A window in an interactive move is on no workspace, and stays as it is.
+        let floating = self.workspaces().any(|(_, _, ws)| ws.has_tiled_windows());
+        for ws in self.workspaces_mut() {
+            ws.set_all_windows_floating(floating);
+        }
+    }
+
     pub fn set_window_floating(&mut self, window: Option<&W::Id>, floating: bool) {
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
@@ -4040,6 +4109,8 @@ impl<W: LayoutElement> Layout<W> {
 
                 tile.stop_move_animations();
                 tile.interactive_move_offset = Point::from((0., 0.));
+                // A floating window keeps its title bar while it moves.
+                tile.is_floating = is_floating;
                 tile.window().output_enter(&output);
                 tile.window().set_preferred_scale_transform(
                     output.current_scale(),

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
-use niri_ipc::{Action, OutputAction};
+use niri_ipc::{Action, OutputAction, WindowShaderRequest};
 
 use crate::utils::version;
 
@@ -112,6 +112,11 @@ pub enum Msg {
     OverviewState,
     /// List screencasts.
     Casts,
+    /// Change or list the shaders that windows are drawn with.
+    WindowShader {
+        #[command(subcommand)]
+        request: WindowShaderRequest,
+    },
     /// Send a raw JSON request to the compositor, reading from stdin.
     RawRequest,
 }

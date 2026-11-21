@@ -21,6 +21,7 @@ use crate::render_helpers::shader_element::ShaderRenderElement;
 use crate::render_helpers::shaders::{mat3_uniform, ProgramType, Shaders};
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::window_shader::CloseShader;
 use crate::render_helpers::{render_to_encompassing_texture, RenderCtx, RenderTarget};
 use crate::utils::transaction::TransactionBlocker;
 
@@ -58,6 +59,9 @@ pub struct ClosingWindow {
 
     /// Random seed for the shader.
     random_seed: f32,
+
+    /// Window shader that draws the close animation instead of the default one.
+    close_shader: Option<CloseShader>,
 }
 
 niri_render_elements! {
@@ -101,6 +105,8 @@ impl ClosingWindow {
         anim: Animation,
     ) -> anyhow::Result<Self> {
         let _span = tracy_client::span!("ClosingWindow::new");
+
+        let close_shader = snapshot.close_shader;
 
         let mut render_to_texture = |elements: Vec<E>| -> anyhow::Result<_> {
             let (texture, _sync_point, geo) = render_to_encompassing_texture(
@@ -152,6 +158,7 @@ impl ClosingWindow {
             buffer_with_blocked_out_bg_offset,
             anim_state: AnimationState::new(blocker, anim),
             random_seed: fastrand::f32(),
+            close_shader,
         })
     }
 
@@ -221,6 +228,25 @@ impl ClosingWindow {
 
         let progress = anim.value();
         let clamped_progress = anim.clamped_value().clamp(0., 1.);
+
+        // The window shader draws the close animation if it was made for that. It's drawn over the
+        // normal contents, which is what the shader got before the window closed.
+        if let Some(close) = &self.close_shader {
+            if !ctx.target.should_block_out(self.block_out_from)
+                && std::ptr::eq(buffer, &self.buffer)
+            {
+                let mut location = self.pos;
+                location.x -= view_rect.loc.x;
+                let elem = close.render(
+                    buffer.texture(),
+                    offset,
+                    location,
+                    scale,
+                    clamped_progress as f32,
+                );
+                return Some(elem.into());
+            }
+        }
 
         if Shaders::get(ctx.renderer)
             .program(ProgramType::Close)

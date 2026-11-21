@@ -155,6 +155,18 @@ layout {
 }
 ```
 
+### `floating-titlebars`
+
+If set, floating windows get a title bar above them, like on macOS: drag the title to move the window, double-click it or press the green button to make the window fill the working area (and again to put it back), press the red button to close the window. niri doesn't minimize windows, so the yellow button stays gray.
+
+The title bar is drawn by niri, so it looks the same for every window, and window shaders draw over it too.
+
+```kdl
+layout {
+    floating-titlebars
+}
+```
+
 ### `default-column-display`
 
 <sup>Since: 25.02</sup>

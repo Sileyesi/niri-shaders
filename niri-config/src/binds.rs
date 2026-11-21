@@ -498,6 +498,7 @@ pub enum Action {
     MoveWindowToTiling,
     #[knuffel(skip)]
     MoveWindowToTilingById(u64),
+    ToggleAllWindowsFloating,
     FocusFloating,
     FocusTiling,
     SwitchFocusBetweenFloatingAndTiling,
@@ -510,6 +511,10 @@ pub enum Action {
     ToggleWindowRuleOpacity,
     #[knuffel(skip)]
     ToggleWindowRuleOpacityById(u64),
+    ShaderPipelineSplash,
+    CycleWindowShader,
+    #[knuffel(skip)]
+    CycleWindowShaderById(u64),
     SetDynamicCastWindow,
     #[knuffel(skip)]
     SetDynamicCastWindowById(u64),
@@ -871,6 +876,7 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::MoveWindowToTiling { id: Some(id) } => {
                 Self::MoveWindowToTilingById(id)
             }
+            niri_ipc::Action::ToggleAllWindowsFloating {} => Self::ToggleAllWindowsFloating,
             niri_ipc::Action::FocusFloating {} => Self::FocusFloating,
             niri_ipc::Action::FocusTiling {} => Self::FocusTiling,
             niri_ipc::Action::SwitchFocusBetweenFloatingAndTiling {} => {
@@ -879,6 +885,9 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::MoveFloatingWindow { id, x, y } => {
                 Self::MoveFloatingWindowById { id, x, y }
             }
+            niri_ipc::Action::ShaderPipelineSplash {} => Self::ShaderPipelineSplash,
+            niri_ipc::Action::CycleWindowShader { id: None } => Self::CycleWindowShader,
+            niri_ipc::Action::CycleWindowShader { id: Some(id) } => Self::CycleWindowShaderById(id),
             niri_ipc::Action::ToggleWindowRuleOpacity { id: None } => Self::ToggleWindowRuleOpacity,
             niri_ipc::Action::ToggleWindowRuleOpacity { id: Some(id) } => {
                 Self::ToggleWindowRuleOpacityById(id)
