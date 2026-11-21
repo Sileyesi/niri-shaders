@@ -1,0 +1,127 @@
+// The look of bea4dev's rainy terminal config for ShojiWM
+// (https://github.com/bea4dev/rainy-terminal-config-shojiwm), made with niri window shaders.
+//
+//     examples/rainy-terminal.sh [wallpaper.png]
+//
+// What carries over:
+//
+// - Terminals (kitty, ghostty) have rain on the blurred glass behind them, under sharp text.
+// - Every window has a 2 px border, gold when focused and gray otherwise, and corners of radius 10.
+// - The blur is dual kawase with radius 4 and 2 passes, behind layer surfaces too (except the
+//   "no_blur" namespace) and their pop-ups.
+//
+// What doesn't: niri draws no title bars, so the title bar with the round buttons isn't there, and
+// the layout is niri's own, not the config's floating and tiling window manager.
+
+prefer-no-csd
+
+blur {
+    passes 2
+    offset 4
+    noise 0
+    saturation 1
+}
+
+layout {
+    gaps 12
+    default-column-width { proportion 0.5; }
+
+    focus-ring {
+        off
+    }
+
+    border {
+        on
+        width 2
+        active-color "#d7ba7d"
+        inactive-color "#4f5666"
+    }
+}
+
+screenshot-path "~/Pictures/Screenshots/niri-rainy %Y-%m-%d %H-%M-%S.png"
+
+spawn-sh-at-startup "[ -n \"$NIRI_DEMO_WALLPAPER\" ] && exec swaybg -i \"$NIRI_DEMO_WALLPAPER\" -m fill"
+spawn-at-startup "kitty" "-o" "background_opacity=0.3"
+spawn-at-startup "kitty" "-o" "background_opacity=0.3" "sh" "-c" "fastfetch; exec $SHELL"
+
+window-rule {
+    geometry-corner-radius 10
+    clip-to-geometry true
+    // Otherwise niri fills the tile behind the window with the border color, which shows through
+    // transparent terminals.
+    draw-border-with-background false
+}
+
+window-rule {
+    match app-id="^kitty$"
+    match app-id="^com\\.mitchellh\\.ghostty$"
+
+    // The rain preset turns on blur behind the window. Its defaults are tuned to look like the
+    // ShojiWM config.
+    shader "preset:rain"
+
+    // To run the original shader from a clone of the config instead (it works unchanged, niri
+    // gives it the blurred backdrop as `tex` and its `time`), use these values from its index.tsx:
+    //
+    // shader "~/src/rainy-terminal-config-shojiwm/src/rain-terminal.frag" {
+    //     uniform "rain_density" 22.0
+    //     uniform "drop_chance" 0.72
+    //     uniform "ripple_speed" 0.42
+    //     uniform "ripple_size" 1.0
+    //     uniform "ripple_strength" 0.12
+    //     uniform "ripple_frequency" 31.0
+    //     uniform "ripple_decay" 2.0
+    //     uniform "refraction_strength" 1.0
+    //     uniform "highlight_intensity" 2.8
+    //     uniform "highlight_sharpness" 6.0
+    //     uniform "rain_tint" 0.94
+    // }
+    // background-effect {
+    //     blur true
+    // }
+}
+
+layer-rule {
+    exclude namespace="^no_blur$"
+
+    background-effect {
+        blur true
+    }
+
+    popups {
+        background-effect {
+            blur true
+        }
+    }
+}
+
+binds {
+    Mod+Shift+S { cycle-window-shader; }
+
+    Mod+Shift+Slash { show-hotkey-overlay; }
+    Mod+T { spawn "kitty" "-o" "background_opacity=0.3"; }
+    Mod+D { spawn "fuzzel"; }
+    Mod+Q { close-window; }
+    Mod+O { toggle-overview; }
+    Mod+Shift+E { quit; }
+
+    Mod+Left  { focus-column-left; }
+    Mod+Right { focus-column-right; }
+    Mod+Up    { focus-window-up; }
+    Mod+Down  { focus-window-down; }
+    Mod+H     { focus-column-left; }
+    Mod+L     { focus-column-right; }
+    Mod+K     { focus-window-up; }
+    Mod+J     { focus-window-down; }
+
+    Mod+Shift+Left  { move-column-left; }
+    Mod+Shift+Right { move-column-right; }
+
+    Mod+V { toggle-window-floating; }
+    Mod+F { maximize-column; }
+    Mod+Shift+F { fullscreen-window; }
+    Mod+R { switch-preset-column-width; }
+
+    Print { screenshot; }
+    Mod+Shift+P { screenshot-screen; }
+}
